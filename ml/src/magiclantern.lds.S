@@ -36,7 +36,7 @@ SECTIONS
 #endif
     .text : {
         _text_start = .;
-        *(.text)
+        *(.text .text.*)
         _text_end = .;
 
 #if defined(POSITION_INDEPENDENT)
