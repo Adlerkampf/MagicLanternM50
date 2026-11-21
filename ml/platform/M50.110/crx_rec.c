@@ -344,7 +344,7 @@ struct job
 /* test59: one RING buffer instead of slots. Frames are packed back to back (pieces padded to 32 bytes);
  * the writer sends big chunks (up to WR_MAX, cut at 4 MB file offsets = SD allocation units).
  * Ring + raw sinks live in Canon's movie RecWork area when it was handed to us, else in fio memory. */
-#define WR_MAX   (8u << 20)
+#define WR_MAX   (16u << 20)
 #define WR_AU    (4u << 20)
 #define RING_TARGET (192u << 20)
 #define NFE 256
@@ -1344,8 +1344,16 @@ static void crx_writer(void *unused)
         idle_ms = 0;
         uint32_t want = MIN(avail, WR_MAX);
         uint32_t au = chunk_bytes % WR_AU;
-        if (au && chunk_bytes + want > chunk_bytes - au + WR_AU) want = WR_AU - au;       /* up to the next 4 MB */
-        else if (!au && want >= WR_AU) want &= ~(WR_AU - 1);
+        if (au)
+        {
+            uint32_t to_au = WR_AU - au;
+            if (want > to_au)
+                want = to_au + ((want - to_au) & ~(WR_AU - 1));
+        }
+        else if (want >= WR_AU)
+        {
+            want &= ~(WR_AU - 1);
+        }
         if (f && chunk_bytes + want > CHUNK_LIMIT)
         {
             /* split files only between frames */
