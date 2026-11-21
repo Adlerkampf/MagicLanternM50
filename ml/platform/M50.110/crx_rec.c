@@ -72,8 +72,10 @@ CONFIG_INT("crx.hwpack", m50_crx_hwpack, 1);
 CONFIG_INT("crx.sample", m50_crx_sample, 0);
 CONFIG_INT("crx.qtest", m50_crx_qtest, 0);
 CONFIG_INT("crx.shutter", m50_crx_shutter, 1);
-CONFIG_INT("crx.startup_tests", m50_crx_startup_tests, 0);
-CONFIG_INT("crx.capture_test", m50_crx_capture_test, 0);
+static const int m50_crx_startup_tests = 0;
+static const int m50_crx_capture_test = 0;
+static const int m50_crx_dma = 1;
+static const int m50_crx_movrel = 1;
 enum { CAPTURE_NORMAL, CAPTURE_RECWORK, CAPTURE_UPPER };
 static volatile int qtest_active;
 static volatile uint32_t qtest_frames;
@@ -111,7 +113,7 @@ void m50_crx_quant_load(void *config, uint32_t planes, uint32_t levels,
             descriptors[band * 16 + 6] = saved[band];
 }
 
-enum crx_depth { CRX_14BIT, CRX_12BIT_CPU, CRX_12BIT_LV };
+enum crx_depth { CRX_14BIT = 0, CRX_12BIT_LV = 1 };
 CONFIG_INT("crx.depth", m50_crx_depth, CRX_12BIT_LV);
 static uint32_t record_bits = 14;
 static int record_native;
@@ -341,7 +343,7 @@ static uint32_t ring_used(void) { uint32_t w = r_wp, r = r_rp; return w >= r ? w
 #define MRRSC_OBJ      0xEB28
 #define MRRSC_STARTUP  0xE02F4F7D
 #define MRRSC_SHUTDOWN 0xE02F54DD
-CONFIG_INT("crx.movrel", m50_crx_movrel, 1);
+/* Movie: free Canon buffers is always enabled (m50_crx_movrel = 1). */
 static int movrel_n = 0, movrel_flag = 0;
 static void mrrsc_log(const char *when);
 static void mrrsc_release(void);
@@ -671,7 +673,7 @@ static void fast_copy(uint8_t *d, const uint8_t *s, uint32_t n)
  *  0 = DMA, 1 channel, 8 rows per job (test67: ~50 ms for 2560x1440 - the per-row cost dominates)
  *  1 = DMA, the whole crop as one PL330 program with 4-byte beats (test71)
  *  2 = CPU, cached reads/writes, whole L1 cleaned/invalidated by set/way before and after */
-extern int m50_crx_dma;
+/* m50_crx_dma is fixed to 1 (DMA). */
 static volatile uint32_t pc_t[3], pc_ok[3], pc_n, pc_m = 0, st_pc_ovw;
 static int pc_allow_wide;
 static unsigned st_pc_wide;
@@ -982,7 +984,6 @@ static void cp_kick_pending(void)
  * 13-25 separate HPCopy calls), falling back to HPCopy / CPU copy if busy. */
 #define HPCOPY 0xE02E0397
 static volatile int cp_dma = 1;
-CONFIG_INT("crx.dma", m50_crx_dma, 1);
 CONFIG_INT("crx.upper", m50_crx_upper, 0);
 
 static int pl_build_pieces(uint8_t *d, uint32_t off, uint32_t n,
@@ -2244,11 +2245,10 @@ static MENU_SELECT_FUNC(crx_reset_settings)
 {
     if (rec_state) return;
     static struct config_var *const settings[] = {
-        &__config_m50_crx_shutter, &__config_m50_crx_startup_tests,
+        &__config_m50_crx_shutter,
         &__config_m50_crx_mode, &__config_m50_crx_qtest, &__config_m50_crx_depth,
-        &__config_m50_crx_sample, &__config_m50_crx_hwpack, &__config_m50_crx_dma,
-        &__config_m50_crx_movrel, &__config_m50_crx_core,
-        &__config_m50_crx_capture_test, &__config_m50_crx_upper
+        &__config_m50_crx_sample, &__config_m50_crx_hwpack,
+        &__config_m50_crx_core, &__config_m50_crx_upper
     };
     for (unsigned i = 0; i < COUNT(settings); i++)
         *settings[i]->value = settings[i]->default_value;
@@ -2425,7 +2425,7 @@ static void crx_overlay_task(void *unused)
 {
     /* The startup task reads magic.cfg before creating this task. */
     if ((unsigned)m50_crx_crop >= COUNT(crop_w)) m50_crx_crop = 0;
-    if ((unsigned)m50_crx_depth > CRX_12BIT_LV) m50_crx_depth = CRX_14BIT;
+    if ((unsigned)m50_crx_depth > CRX_12BIT_LV) m50_crx_depth = CRX_12BIT_LV;
     if ((unsigned)m50_crx_qtest > 6) m50_crx_qtest = 0;
     int saved_crop = m50_crx_crop;
     enum { PAD = 9, GAP = 4 };
@@ -2583,14 +2583,9 @@ static struct menu_entry crx_menu[] = {
             { .name = "Record",        .select = crx_toggle, .update = crx_update },
             { .name = "Movie shutter", .priv = &m50_crx_shutter, .max = 1,
               .choices = CHOICES("Canon", "Start/stop CRX") },
-            { .name = "Capture buffer A/B", .priv = &m50_crx_capture_test, .max = CAPTURE_UPPER,
-              .choices = CHOICES("Off", "RecWork", "Upper capture"),
-              .help = "Uses the same write ring in both tests. Logs early drops." },
             { .name = "Upper buffer",  .priv = &m50_crx_upper, .max = 1,
               .choices = CHOICES("OFF (RecWork only)", "ON (4K extra sinks)"),
               .help = "Off: stay inside 200 MB RecWork. On: grab Canon upper SRM buffer." },
-            { .name = "Startup tests", .priv = &m50_crx_startup_tests, .max = 1,
-              .choices = CHOICES("Off", "Warm-up and benchmark") },
             { .name = "Compression",   .priv = &m50_crx_mode, .max = 1,
               .choices = CHOICES("Lossless", "C-RAW (lossy)"),
               .help = "C-RAW reduces detail and file size." },
@@ -2602,8 +2597,8 @@ static struct menu_entry crx_menu[] = {
               .select = crx_video_system_select, .update = crx_video_system_update,
               .help = "Switches Canon PROP_VIDEO_SYSTEM between 23.98p and 25p." },
             { .name = "Bit depth", .priv = &m50_crx_depth, .max = CRX_12BIT_LV,
-              .choices = CHOICES("14-bit", "12-bit CPU", "12-bit Live View (test)"),
-              .help = "Needs movie mode and free Canon buffers." },
+              .choices = CHOICES("14-bit", "12-bit"),
+              .help = "12-bit or 14-bit RAW capture." },
             { .name = "Card writes",   .priv = &m50_crx_sample, .max = 1,
               .choices = CHOICES("All frames", "1 in 24 (pipeline test)"),
               .help = "Encodes all frames, saves one in 24." },
@@ -2613,12 +2608,6 @@ static struct menu_entry crx_menu[] = {
             { .name = "Crop", .priv = &m50_crx_crop, .max = 6, .select = crop_select,
               .choices = CHOICES("Full stream", "3.5K 3584x1504", "3.5K 3584x2016", "3K 3072x1288", "3K 3072x1728", "2.8K 2880x1200", "2.5K 2560x1440"),
               .help = "Crop before encoding." },
-            { .name = "Frame copy", .priv = &m50_crx_dma, .max = 1,
-              .choices = CHOICES("CPU (test58)", "DMA (HPCopy)"),
-              .help = "DMA falls back to CPU if its check fails." },
-            { .name = "Movie: free Canon buffers", .priv = &m50_crx_movrel, .max = 1,
-              .choices = CHOICES("OFF", "ON (experimental)"),
-              .help = "Borrow Canon's movie buffers while CRX records." },
             { .name = "Repack on core", .priv = &m50_crx_core, .max = 1,
               .choices = CHOICES("main (0)", "second (1)") },
             { .name = "Reset settings", .select = crx_reset_settings },
