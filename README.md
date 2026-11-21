@@ -6,7 +6,7 @@ Hardware-accelerated CRX (CR3 / C-RAW) RAW video recording on the **Canon EOS M5
 
 - **Hardware CRX Encoder (`crx_rec.c`)**
   - Uses Canon's built-in DIGIC 8 CR3/C-RAW hardware encoder (`ALGS_REQUEST`) for real-time compressed RAW video.
-  - **12-bit Live View** & **14-bit** capture, **C-RAW (lossy)** and **Lossless** modes, plus configurable C-RAW quantization strength.
+  - **12-bit** (default) & **14-bit** capture, **C-RAW (lossy)** and **Lossless** modes, plus configurable C-RAW quantization strength.
   - **PL330 DMA multi-piece frame copy** and **3-buffer capture pipeline** for smooth continuous recording.
   - **Crop modes** (with CMOS vertical row-window cropping in `sensor_crop.c`):
     - Full stream (4K)
@@ -16,12 +16,18 @@ Hardware-accelerated CRX (CR3 / C-RAW) RAW video recording on the **Canon EOS M5
     - `2.5K 2560x1440` (16:9)
   - **NTSC (23.98p) / PAL (25p) Video System toggle** directly from the CRX menu.
   - **Movie shutter button** start/stop recording and live recording HUD (buffer fill, write/need MB/s, SD & camera drop counters).
-- **SD Card UHS-I 195 MHz Tuning (`sd_speed.c`)**
-  - Overclocks SD UHS-I clock to 195 MHz (SDR104) with hardware phase tuning for sustained high-bitrate RAW writes.
-- **Idle Sleep / Wake-up Support**
-  - Tracks Canon's `GUILockTask` display state so Magic Lantern pauses Ximr refreshes, EDMAC polling, and shutter interception when the camera enters idle/display-off sleep.
 - **`crx2dng` Desktop Converter (`crx2dng/`)**
   - Converts `.CRX` recordings into CinemaDNG frame sequences (`crx2dng` CLI & GUI).
+
+## How to Record
+
+1. **Prepare the SD card:** Make sure your Canon EOS M50 (firmware **1.1.0**) has the bootflag enabled and a bootable UHS-I V30/V60 SD card (`ml/platform/M50.110/tools/make_bootable.py`). Extract `magiclantern.zip` to the root of the SD card.
+2. **Switch to Movie mode (4K):** Turn the mode dial to **Movie** and set Canon's movie recording size to **4K** (for crop modes) or **1080p**.
+3. **Configure CRX (optional):** Press the **Trash** button to open the Magic Lantern menu, then go to **Debug → CRX recording**.
+   - Default settings are ready to shoot: **3K 3072×1728 (16:9)**, **12-bit**, **C-RAW (lossy)**, **Movie shutter = Start/stop CRX**.
+   - Use **Video system** to switch between **NTSC (23.98p)** and **PAL (25p)**, and **Crop** to pick another resolution.
+4. **Record:** Close the menu and wait for **`CRX READY`** on the Live View HUD. Press the **shutter button** to start recording, and press it again to stop.
+5. **Convert to CinemaDNG:** Copy the `.CRX` files from `ML/CRX/` on your SD card to your PC and drag-and-drop them onto `crx2dng/convert_to_resolve.bat` (or open them in `crx2dng_gui.exe`) to generate DaVinci Resolve–ready CinemaDNG folders.
 
 ## Repository Layout
 
@@ -51,8 +57,8 @@ arm-none-eabi-nm build/magiclantern | grep _bss_end
 
 ## Building `crx2dng`
 
-See `crx2dng/build.bat` (Windows). Place LibRaw / dependencies in `crx2dng/third_party/` before building.
+Run `crx2dng\build.bat` on Windows (requires Visual Studio / C++ Build Tools; auto-detected via `vswhere.exe`).
 
 ## License
 
-Magic Lantern and the M50 1.1.0 platform code are licensed under **GPLv2** (see `ml/COPYING` / file headers).
+Magic Lantern and the M50 1.1.0 platform code are licensed under **GPLv2** (see `LICENSE` / `ml/COPYING`).
