@@ -361,7 +361,6 @@ static volatile int st_cache_bad = 0;
 static uint64_t rec_t0_us;
 static volatile unsigned rec_fps;
 static volatile int rec_write_rate10, rec_need_rate10;  /* tenths of decimal MB/s, -1 before a sample */
-static volatile uint32_t warmup_drops;
 static uint32_t frame_counter = 0;
 
 static uint32_t crx_camera_drop_count(void)
@@ -371,7 +370,7 @@ static uint32_t crx_camera_drop_count(void)
 
 static int crx_take_drops(void)
 {
-    return (int)(crx_camera_drop_count() - warmup_drops + st_drop_queue);
+    return (int)(crx_camera_drop_count() + st_drop_queue);
 }
 
 /* log */
@@ -426,29 +425,8 @@ static struct msg_queue *current_work_mq(void)
 
 /* Native 4K needs no repack. Post directly to the encoder FIFO so the
  * completed buffers are queued in sensor order. The hook alone picks cur. */
-enum { TRACE_HARDWARE = 1, TRACE_COPY_WAIT = 2 };
-#define DROP_TRACE_LIMIT 128
-struct capture_drop
-{
-    uint32_t time, stage, age, queue, encode, copy_wait;
-    int post_failed;
-};
-static struct capture_drop *drop_trace;
-static volatile int trace_on;
-static unsigned trace_count;
-static uint32_t trace_start;
-static volatile uint32_t trace_stage, trace_queue, trace_encode, trace_copy_wait;
-
-static uint32_t trace_begin(unsigned stage)
-{
-    uint32_t now = get_us_clock() - rec_t0_us;
-    trace_stage = (now & ~3u) | stage;
-    return now;
-}
-
 static int crx_queue_native_sink(int current)
 {
-    int post_failed = 0;
     for (int i = 1; i < 3; i++)
     {
         int next = (current + i) % 3;
@@ -471,23 +449,9 @@ static int crx_queue_native_sink(int current)
             return next;
         }
         sink_owned[current] = 0;
-        post_failed = 1;
         break;
     }
     st_drop_worker++;
-    if (trace_on && trace_count < DROP_TRACE_LIMIT)
-    {
-        uint32_t now = get_us_clock() - rec_t0_us;
-        if (now - trace_start < 5000000)
-        {
-            uint32_t stage = trace_stage;
-            struct capture_drop *drop = &drop_trace[trace_count++];
-            *drop = (struct capture_drop) {
-                now - trace_start, stage & 3, stage ? now - (stage & ~3u) : 0,
-                trace_queue, trace_encode, trace_copy_wait, post_failed
-            };
-        }
-    }
     return current;
 }
 
@@ -668,34 +632,7 @@ static void fast_copy(uint8_t *d, const uint8_t *s, uint32_t n)
 static volatile uint32_t pc_m = 1, st_pc_ovw;
 static int pc_allow_wide;
 static unsigned st_pc_wide;
-/* one channel, one job of up to 8 row descriptors per call - exactly what worked in test67.
- * test68's single call with several jobs on several channels crashed: ClkgenGearApi.c:852 assert in the Xdmac
- * interrupt (0xE0145A9C) - one clock "on" per call, one "off" per finished channel. Never put 2+ jobs in one call.
- * part/parts: this caller does the 8-row blocks b with b % parts == part. */
-static int pc_dma_rows(uint8_t *dst, uint8_t *src, int part, int parts)
-{
-    uint32_t *ch = ((uint32_t *(*)(void)) 0xE02E035B)();
-    if (!ch) return -1;
-    int (*run)(uint32_t *, int, int) = (void *) 0xE014585B;
-    uint32_t dsc[8][4] __attribute__((aligned(16))); uint32_t job[3]; int fail = 0;
-    for (uint32_t r = 8 * part; r < enc_h && !fail; r += 8 * parts)
-    {
-        uint32_t n = MIN(8, enc_h - r);
-        for (uint32_t k = 0; k < n; k++)
-        { dsc[k][0] = (uint32_t)(dst + (r + k) * pc_rowb); dsc[k][1] = (uint32_t)(src + (r + k) * pitch); dsc[k][2] = pc_rowb; dsc[k][3] = 0; }
-        job[0] = *ch; job[1] = (uint32_t) dsc; job[2] = n;
-        if (run(job, 1, 0)) fail = 1;
-    }
-    ((void (*)(uint32_t *)) 0xE02E0685)(ch);
-    return fail ? -1 : 1;
-}
-/* test70: the whole crop as ONE PL330 program (Canon's Xdmac is an ARM PL330: opcodes 0xBC DMAMOV, 0x13 WMB, 0x34 SEV...).
- * Canon's path for one job is replicated with our own program text in place of 0xE0145C82's:
- *   take channel semaphore *(0x572DC + 4*ch) (0xE0577C5C), 0xE0145BFC(job, 1, bufs) (records the job, cache ops on a
- *   tiny dummy descriptor), 0xE0796A16/AA0/BE0, 0xE0095CB0(ch, prog, 0) (DMAGO via the debug registers),
- *   0xE0145BA2(job, 1) (waits for the SEV interrupt; Canon's handler gives the semaphore back and gears the clock down).
- * Program: burst 16, both addresses incrementing (Canon's prot bits 0x1C00700); per row LP lc0 {LD ST},
- * tail burst if needed, ADDH SAR (pitch - rowbytes); rows in blocks of <= 256 on lc1; epilogue by Canon's 0xE0095C8C (SEV + END). */
+/* PL330 crop program (Canon's Xdmac is an ARM PL330). */
 static uint8_t *pl_prog, *cp_prog;           /* PL330 program slots in RecWork (uncached) */
 #define PL_CCR(beat_shift, len) (1 | ((beat_shift) << 1) | (((len) - 1) << 4) | (1 << 14) | ((beat_shift) << 15) | (((len) - 1) << 18) | 0x1C00700)
 static inline uint8_t *pl_mov(uint8_t *p, int rd, uint32_t v) { p[0] = 0xBC; p[1] = rd; p[2] = v; p[3] = v >> 8; p[4] = v >> 16; p[5] = v >> 24; return p + 6; }
@@ -759,43 +696,6 @@ static void pc_cpu_copy(uint8_t *dst, uint8_t *src)
     uint8_t *cd = (uint8_t *) CACHEABLE(dst), *cs = (uint8_t *) CACHEABLE(src);
     for (uint32_t y = 0; y < enc_h; y++) fast_copy(cd + y * pc_rowb, cs + y * pitch, pc_rowb);
     l1_setway(0);
-}
-
-/* Canon packs each group of eight samples LSB-first. Drop two low bits
- * from each 14-bit sample and pack the result into three 32-bit words. */
-static void pack_12bit_row(uint32_t *dst, const uint16_t *src, uint32_t pixels)
-{
-    for (uint32_t x = 0; x < pixels; x += 8, src += 7, dst += 3)
-    {
-        uint32_t a = src[0] | ((uint32_t) src[1] << 16);
-        uint32_t b = src[2] | ((uint32_t) src[3] << 16);
-        uint32_t c = src[4] | ((uint32_t) src[5] << 16);
-        uint32_t d = src[6];
-        uint32_t p0 = (a >> 2) & 0xFFF;
-        uint32_t p1 = (a >> 16) & 0xFFF;
-        uint32_t p2 = ((a >> 30) | (b << 2)) & 0xFFF;
-        uint32_t p3 = (b >> 12) & 0xFFF;
-        uint32_t p4 = ((b >> 26) | (c << 6)) & 0xFFF;
-        uint32_t p5 = (c >> 8) & 0xFFF;
-        uint32_t p6 = ((c >> 22) | (d << 10)) & 0xFFF;
-        uint32_t p7 = d >> 4;
-        dst[0] = p0 | (p1 << 12) | (p2 << 24);
-        dst[1] = (p2 >> 8) | (p3 << 4) | (p4 << 16) | (p5 << 28);
-        dst[2] = (p5 >> 4) | (p6 << 8) | (p7 << 20);
-    }
-}
-
-static void prepare_12bit(uint8_t *dst, uint8_t *src)
-{
-    uint32_t start = us_timer();
-    l1_setway(1);
-    uint8_t *cd = (uint8_t *) CACHEABLE(dst), *cs = (uint8_t *) CACHEABLE(src);
-    uint32_t row_bytes = enc_w * 3 / 2;
-    for (uint32_t y = 0; y < enc_h; y++, cd += row_bytes, cs += pitch)
-        pack_12bit_row((uint32_t *) cd, (const uint16_t *) cs, enc_w);
-    l1_setway(0);
-    st_pc_us = (us_timer() - start) & 0xFFFFF;
-    if (st_pc_us > st_pc_max) st_pc_max = st_pc_us;
 }
 
 static void precrop(uint8_t *dst, uint8_t *src)
@@ -942,14 +842,7 @@ static void cp_kick_pending(void)
     if (!pending_h) return;
     void *h = pending_h;
     pending_h = 0;
-    if (trace_on)
-    {
-        uint32_t start = trace_begin(TRACE_COPY_WAIT);
-        cp_wait_and_free();
-        trace_copy_wait = (uint32_t)(get_us_clock() - rec_t0_us) - start;
-        trace_stage = 0;
-    }
-    else cp_wait_and_free();
+    cp_wait_and_free();
     if (cp_state == 1) { LOG("copier stuck\n"); stop_req = 1; free_handle(h); return; }
     cp_h = h; cp_frame = pending_frame; cp_ts = pending_ts; cp_quant = pending_quant;
     asm volatile("dmb sy" ::: "memory");
@@ -1172,7 +1065,6 @@ static void crx_encoder(void *unused)
         free_late();
         if (msg_queue_receive(enc_mq, &msg, 0)) { cp_kick_pending(); msleep(10); continue; }
         enc_taken++;
-        if (trace_on) trace_queue = (uint32_t)(get_us_clock() - rec_t0_us) - (msg & ~15u);
         int e = (msg & CRX_MSG_THIRD_SINK) ? 2 : (msg & 1);
         int from_sink = (msg & CRX_MSG_SINK) != 0;     /* zero copy: e is a sink index */
         int sink_held = from_sink;
@@ -1203,14 +1095,12 @@ static void crx_encoder(void *unused)
         req.mode = m50_crx_mode ? 4 : 0;
         req.w = enc_w; req.h = enc_h; req.p3 = 0; req.p4 = 0; req.bits = record_bits;
         req.addr = (from_sink ? (uint32_t) sink[e] : (uint32_t) encin[e]) + enc_off; req.stride = width;
-        int software_12bit = record_bits == 12 && !record_native;
-        if (software_12bit || pc_rowb)
+        if (pc_rowb)
         {
             /* Finish any in-flight copier DMA before pre-crop touches Xdmac. */
             cp_wait_and_free();
             uint8_t *src = (uint8_t *) req.addr, *dst = pc_buf[record_native ? 0 : e];
-            if (software_12bit) prepare_12bit(dst, src);
-            else precrop(dst, src);
+            precrop(dst, src);
             req.addr = (uint32_t) dst; req.stride = enc_w;
             if (native_crop)
             {
@@ -1225,6 +1115,7 @@ static void crx_encoder(void *unused)
         cb_handle = 0; cb_a2 = 0;
         if (diag_e == 0)
         {
+            diag_e = 1;
             /* RAW mode 0 and C-RAW mode 4 use codec IDs 0 and 4 respectively.
              * Reinitialize the selected codec before the first job of this take. */
             uint32_t mgr = *(volatile uint32_t *) ALGSMGR_PTR;
@@ -1239,13 +1130,11 @@ static void crx_encoder(void *unused)
         int quant = req.mode == 4 ? m50_crx_qtest : 0;
         uint32_t quant_loads = qtest_frames;
         qtest_active = quant;
-        if (trace_on) trace_begin(TRACE_HARDWARE);
         crx_algs_request(&req, 1, enc_cbr, (void *) seq);
         /* While the CRX hardware encoder ASIC runs this frame, copy and free
          * the previous frame's handle on Core 0 + Xdmac HPCopy in parallel. */
         cp_kick_pending();
         int ok = take_semaphore(enc_sem, 1000) == 0;
-        trace_stage = 0;
         qtest_active = 0;
         if (!ok)
         {
@@ -1276,7 +1165,6 @@ static void crx_encoder(void *unused)
         if (sink_held) crx_release_sink(e);
         else if (!from_sink) encin_state[e] = 0;
         st_enc_us = us; if (us > st_enc_max) st_enc_max = us;
-        if (trace_on) trace_encode = us;
         st_encoded++;
 
         uint32_t *hw = (uint32_t *) h;
@@ -1497,8 +1385,7 @@ static int alloc_buffers(uint32_t upper_base)
     extern int GetFreeMemForAllocateMemory();
     LOG("memory: malloc free %d KB, AllocateMemory free %d KB\n", GetFreeMemForMalloc() >> 10, GetFreeMemForAllocateMemory() >> 10);
     uint32_t fb = (frame_bytes + 0xFFFF) & ~0xFFFF;
-    uint32_t input_row_bytes = record_bits == 12 && !record_native ? enc_w * 3 / 2 : pc_rowb;
-    uint32_t pcb = (input_row_bytes * enc_h + 0xFFFF) & ~0xFFFF;
+    uint32_t pcb = (pc_rowb * enc_h + 0xFFFF) & ~0xFFFF;
     uint32_t pc_count = record_native ? 1 : 2;
     uint32_t pl_size = 0x10000;
     uint32_t reserved = 2 * fb + pc_count * pcb + pl_size + 0x10000;
@@ -1968,7 +1855,6 @@ static void crx_control(void *from_shutter)
     st_enc_max = st_write_ms = 0;
     rec_fps = 0;
     rec_write_rate10 = rec_need_rate10 = -1;
-    warmup_drops = 0;
     frame_counter = 0;
     rec_t0_us = get_us_clock();
     {
@@ -2004,9 +1890,6 @@ static void crx_control(void *from_shutter)
     if (sink_count == 3) LOG("4K: three capture buffers, %d KB write ring\n", ring_size >> 10);
     rec_state = 2;
     uint32_t capture_start = get_ms_clock();
-    trace_count = trace_stage = trace_queue = trace_encode = trace_copy_wait = 0;
-    trace_start = get_us_clock() - rec_t0_us;
-    trace_on = 0;
     rec_live = 1;
     asm volatile("dmb sy" ::: "memory");
     routing = 1;
@@ -2084,18 +1967,6 @@ static void crx_control(void *from_shutter)
     { FILE *ff = f; f = 0; asm volatile("dmb sy" ::: "memory"); for (int i = 0; i < 3000 && writer_busy; i++) msleep(10); if (ff) FIO_CloseFile(ff); }
     r_rp = r_wp; r_wrap = 0xFFFFFFFF;
     msleep(300);                 /* Canon is back on its own LV buffer */
-    if (trace_on)
-    {
-        trace_on = 0;
-        LOG("Capture drops, first 5 s (us): time, reason, active stage, stage age, last queue, encode, copy wait\n");
-        for (unsigned i = 0; i < trace_count; i++)
-        {
-            const struct capture_drop *d = &drop_trace[i];
-            LOG("Drop %d %s %s %d %d %d %d\n", d->time, d->post_failed ? "post" : "busy",
-                d->stage == TRACE_HARDWARE ? "encode" : d->stage == TRACE_COPY_WAIT ? "copy" : "other",
-                d->age, d->queue, d->encode, d->copy_wait);
-        }
-    }
     if (crx_capture_busy())
     {
         LOG("stop: encoder may still read a sink\n");
@@ -2375,7 +2246,7 @@ static void crx_overlay_task(void *unused)
         {
             fill = MIN(ring_used() >> 8, capacity) * 100 / capacity;
             uint32_t sd_drops = st_drop_queue;
-            uint32_t camera_drops = crx_camera_drop_count() - warmup_drops;
+            uint32_t camera_drops = crx_camera_drop_count();
             drops = sd_drops + camera_drops;
             int point = fill * CRX_GRAPH_HEIGHT / 100;
             if (sd_drops > previous_sd_drops) point |= CRX_GRAPH_SD_DROP;

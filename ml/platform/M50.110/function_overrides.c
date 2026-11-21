@@ -217,110 +217,7 @@ struct m2m_copy_info {
 #endif
 #endif
 
-/* ---- DMA frame copy via Canon's HPCopy (System/HPCopy.c, XDMAC) ----
- * HPCopy 0xE02E0396: synchronous, (a, b, size), returns 0 on success.
- * Which of a/b is the destination is not known from static analysis, so a
- * self-test on our own two buffers decides it before any real use.
- * Menu: Debug -> M50 RAW probe -> Frame copy. */
-#define M50_HPCOPY 0xE02E0397   /* Thumb */
-int m50_copy_mode = 2;          /* 0 = CPU uncached, 1 = DMA (HPCopy), 2 = CPU cached */
 volatile int m50_cached_copy_bad = 0;
-volatile int m50_dma_state = 0; /* 0 untested, 1 ok, -1 failed, 2 testing */
-volatile int m50_dma_dst_first = 1;
-volatile int m50_dma_line_us = 0, m50_dma_fail_step = 0;
-
-static int hpcopy_raw(void *a, void *b, uint32_t n)
-{
-    int (*fn)(void *, void *, uint32_t) = (void *) M50_HPCOPY;
-    return fn(a, b, n);
-}
-
-static void m50_dcache_clean_inval(void *p, uint32_t n)
-{
-    uint32_t a = (uint32_t)CACHEABLE(p) & ~31u, end = (uint32_t)CACHEABLE(p) + n;
-    for (; a < end; a += 32) asm volatile("mcr p15, 0, %0, c7, c14, 1" :: "r"(a));
-    asm volatile("dsb sy" ::: "memory");
-}
-
-static int dma_copy(void *dst, void *src, uint32_t n)
-{
-    void *pd = CACHEABLE(dst), *ps = CACHEABLE(src);  /* physical addresses */
-    return m50_dma_dst_first ? hpcopy_raw(pd, ps, n) : hpcopy_raw(ps, pd, n);
-}
-
-static int pattern_ok(uint8_t *p, uint8_t *ref, int n)
-{
-    for (int i = 0; i < n; i++) if (p[i] != ref[i]) return 0;
-    return 1;
-}
-
-static void m50_dma_selftest_task(void *unused)
-{
-    const int N = 0x10000;
-    uint8_t *a = fio_malloc(N), *b = fio_malloc(N);
-    m50_dma_fail_step = 0;
-    if (!a || !b) { m50_dma_fail_step = 1; goto fail; }
-    m50_dcache_clean_inval(a, N); m50_dcache_clean_inval(b, N);
-    uint8_t *ua = UNCACHEABLE(a), *ub = UNCACHEABLE(b);
-
-    /* 1. direction: a = pattern, b = zeros, copy with "b is destination" */
-    for (int i = 0; i < N; i++) { ua[i] = (i * 131 + 7) & 0xFF; ub[i] = 0; }
-    if (hpcopy_raw(CACHEABLE(b), CACHEABLE(a), 4096)) { m50_dma_fail_step = 2; goto fail; }
-    if (pattern_ok(ub, ua, 4096)) m50_dma_dst_first = 1;
-    else
-    {
-        /* maybe (src, dst): a was overwritten with b's zeros, refill and retry */
-        for (int i = 0; i < N; i++) { ua[i] = (i * 131 + 7) & 0xFF; ub[i] = 0; }
-        if (hpcopy_raw(CACHEABLE(a), CACHEABLE(b), 4096)) { m50_dma_fail_step = 3; goto fail; }
-        if (!pattern_ok(ub, ua, 4096)) { m50_dma_fail_step = 4; goto fail; }
-        m50_dma_dst_first = 0;
-    }
-
-    /* 2. the odd offsets/lengths mlv_lite uses (14-bit packing: 2-byte aligned) */
-    static const int offs[][3] = { {182, 0, 1120}, {2, 6, 1218}, {14, 8, 3668}, {0, 2, 7644} };
-    for (int t = 0; t < 4; t++)
-    {
-        for (int i = 0; i < N; i++) { ua[i] = (i * 37 + t) & 0xFF; ub[i] = 0xEE; }
-        int so = offs[t][0], dof = offs[t][1], len = offs[t][2];
-        if (dma_copy(b + dof, a + so, len)) { m50_dma_fail_step = 10 + t; goto fail; }
-        if (!pattern_ok(ub + dof, ua + so, len)) { m50_dma_fail_step = 20 + t; goto fail; }
-        if (dof && ub[dof - 1] != 0xEE) { m50_dma_fail_step = 30 + t; goto fail; }
-        if (ub[dof + len] != 0xEE) { m50_dma_fail_step = 40 + t; goto fail; }
-    }
-
-    /* 3. timing: 360 lines of 1120 bytes, like a 640x360 frame */
-    uint32_t t0 = *(volatile uint32_t *)0xC0242014;
-    for (int y = 0; y < 50; y++) dma_copy(b + (y & 15) * 1200, a + (y & 15) * 1300, 1120);
-    m50_dma_line_us = (((*(volatile uint32_t *)0xC0242014) - t0) & 0xFFFFF) / 50;
-
-    fio_free(a); fio_free(b);
-    m50_dma_state = 1;
-    return;
-fail:
-    if (a) fio_free(a);
-    if (b) fio_free(b);
-    m50_dma_state = -1;
-}
-
-void m50_dma_selftest_start(void)
-{
-    if (m50_dma_state == 2) return;
-    m50_dma_state = 2;
-    task_create("m50_dma_test", 0x1e, 0x1000, m50_dma_selftest_task, 0);
-}
-
-/* returns 1 if the copy was done by DMA */
-static int m50_dma_copy_rect(uint8_t *d, uint8_t *s, int src_width, int dst_width, int w, int h)
-{
-    if (m50_copy_mode != 1 || m50_dma_state != 1) return 0;
-    m50_dcache_clean_inval(d, (uint32_t)dst_width * h);  /* no dirty lines over DMA data */
-    if (w == src_width && w == dst_width)
-        return dma_copy(d, s, (uint32_t)w * h) == 0;
-    for (int y = 0; y < h; y++)
-        if (dma_copy(d + y * dst_width, s + y * src_width, w))
-            return 0;   /* partial: CPU path redoes the whole frame */
-    return 1;
-}
 
 void* edmac_copy_rectangle_cbr_start(void *dst, void *src,
                                      int src_width, int src_x, int src_y,
@@ -339,16 +236,10 @@ void* edmac_copy_rectangle_cbr_start(void *dst, void *src,
     uint8_t *d = (uint8_t *)dst + dst_x + dst_y * dst_width;
 
 #if M50_FRAME_COPY_BACKEND == M50_COPY_CPU
-    if (m50_dma_copy_rect(d, s, src_width, dst_width, w, h))
-    {
-        goto done;
-    }
     /* Line by line, so cropping works too.
-     * Source was written by Canon's DMA. Mode 2 ("CPU cached"): invalidate
-     * the source range in the data cache, then read it through the cache
-     * (uncached reads made a 640x360 frame take ~28 ms). A spot check
-     * compares cached vs uncached words; any mismatch = back to uncached. */
-    if (m50_copy_mode == 2 && !m50_cached_copy_bad)
+     * Source was written by Canon's DMA: invalidate the source range in the
+     * data cache, then read it through the cache with a spot check fallback. */
+    if (!m50_cached_copy_bad)
     {
         uint8_t *cs = (uint8_t *)CACHEABLE(s);
         uint32_t span = (uint32_t)src_width * (h - 1) + w;
