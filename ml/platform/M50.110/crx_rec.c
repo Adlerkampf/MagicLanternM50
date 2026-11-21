@@ -72,11 +72,6 @@ CONFIG_INT("crx.hwpack", m50_crx_hwpack, 1);
 CONFIG_INT("crx.sample", m50_crx_sample, 0);
 CONFIG_INT("crx.qtest", m50_crx_qtest, 0);
 CONFIG_INT("crx.shutter", m50_crx_shutter, 1);
-static const int m50_crx_startup_tests = 0;
-static const int m50_crx_capture_test = 0;
-static const int m50_crx_dma = 1;
-static const int m50_crx_movrel = 1;
-enum { CAPTURE_NORMAL, CAPTURE_RECWORK, CAPTURE_UPPER };
 static volatile int qtest_active;
 static volatile uint32_t qtest_frames;
 static volatile uint8_t qtest_first;
@@ -669,12 +664,8 @@ static void fast_copy(uint8_t *d, const uint8_t *s, uint32_t n)
     if (n) memcpy(d, s, n);
 }
 
-/* Pre-crop: time each copy method during warm-up, then use the fastest one that passes its spot check:
- *  0 = DMA, 1 channel, 8 rows per job (test67: ~50 ms for 2560x1440 - the per-row cost dominates)
- *  1 = DMA, the whole crop as one PL330 program with 4-byte beats (test71)
- *  2 = CPU, cached reads/writes, whole L1 cleaned/invalidated by set/way before and after */
-/* m50_crx_dma is fixed to 1 (DMA). */
-static volatile uint32_t pc_t[3], pc_ok[3], pc_n, pc_m = 0, st_pc_ovw;
+/* Pre-crop: PL330 DMA (pc_m = 1), falling back to CPU cached (pc_m = 2) if needed. */
+static volatile uint32_t pc_m = 1, st_pc_ovw;
 static int pc_allow_wide;
 static unsigned st_pc_wide;
 /* one channel, one job of up to 8 row descriptors per call - exactly what worked in test67.
@@ -809,8 +800,7 @@ static void prepare_12bit(uint8_t *dst, uint8_t *src)
 
 static void precrop(uint8_t *dst, uint8_t *src)
 {
-    int m = 2;
-    if (m50_crx_dma) m = pc_n < 3 ? (int) pc_n : (int) pc_m;
+    int m = (int) pc_m;
     /* Four adjacent rows cover all four source alignments modulo 16 at pitch 7644. */
     uint32_t r = frame_counter % (enc_h - 3);
     uint8_t snap[4][2][64];
@@ -827,10 +817,8 @@ static void precrop(uint8_t *dst, uint8_t *src)
      * for unaligned crops and for the existing 14-bit path. */
     int wide = m == 1 && pc_allow_wide &&
                !(((uintptr_t)src | (uintptr_t)dst | pitch | pc_rowb) & 7);
-    if (m == 0) good = pc_dma_rows(dst, src, 0, 1) > 0;
-    else if (m == 1) good = pl_run(dst, src, pitch, wide ? 3 : 2) == 0;
+    if (m == 1) good = pl_run(dst, src, pitch, wide ? 3 : 2) == 0;
     else pc_cpu_copy(dst, src);
-    uint32_t us = (us_timer() - t) & 0xFFFFF;
     int changed = 0;
     for (int q = 0; q < 4; q++)
     {
@@ -848,16 +836,6 @@ static void precrop(uint8_t *dst, uint8_t *src)
         pc_cpu_copy(dst, src);
     }
     else if (wide) st_pc_wide++;
-    if (pc_n < 3)
-    {
-        pc_t[m] = us; pc_ok[m] = good; pc_n++;
-        if (pc_n == 3)
-        {
-            pc_m = 2;
-            for (int k = 0; k < 2; k++)
-                if (pc_ok[k] && (!pc_ok[pc_m] || pc_t[k] < pc_t[pc_m])) pc_m = k;
-        }
-    }
     st_pc_us = (us_timer() - t) & 0xFFFFF;
     if (st_pc_us > st_pc_max) st_pc_max = st_pc_us;
 }
@@ -1258,11 +1236,6 @@ static void crx_encoder(void *unused)
         enc_seq = seq;
         asm volatile("dmb sy" ::: "memory");
         uint32_t t0 = us_timer();
-        if (diag_e++ < 3 && m50_crx_startup_tests)
-        {
-            LOG("diag: request %d %dx%d at %08x\n", seq, req.w, req.h, req.addr);
-            save_log();
-        }
         int quant = req.mode == 4 ? m50_crx_qtest : 0;
         uint32_t quant_loads = qtest_frames;
         qtest_active = quant;
@@ -1518,7 +1491,7 @@ static void *get_buf(int k, uint32_t size, const char *what, int quiet)
     return 0;
 }
 
-static int alloc_buffers(uint32_t upper_base, int capture_test)
+static int alloc_buffers(uint32_t upper_base)
 {
     free_buffers();
     extern int GetFreeMemForAllocateMemory();
@@ -1535,7 +1508,7 @@ static int alloc_buffers(uint32_t upper_base, int capture_test)
         rw_size >= reserved + fb + (160u << 20))
     {
         sink_count = 3;
-        reserved = upper_base && !capture_test ? pc_count * pcb + pl_size + 0x10000 : reserved + fb;
+        reserved = upper_base ? pc_count * pcb + pl_size + 0x10000 : reserved + fb;
     }
     if (record_bits == 12 && (!rw_addr || rw_size <= reserved + (32u << 20)))
     {
@@ -1550,7 +1523,7 @@ static int alloc_buffers(uint32_t upper_base, int capture_test)
         sink_mem[0] = sink[0] = (void *) capture_base;
         sink_mem[1] = sink[1] = (void *) (capture_base + fb);
         if (sink_count == 3) sink[2] = (void *) (capture_base + 2 * fb);
-        pc_buf[0] = (uint8_t *) (base + (upper_base && !capture_test ? 0 : sink_count * fb));
+        pc_buf[0] = (uint8_t *) (base + (upper_base ? 0 : sink_count * fb));
         pc_buf[1] = pc_buf[0] + (pc_count > 1 ? pcb : 0);
         pl_prog = pc_buf[0] + pc_count * pcb;
         cp_prog = pl_prog + 0x8000;
@@ -1942,34 +1915,13 @@ static void crx_control(void *from_shutter)
         is_movie_mode(), *(volatile uint32_t *)(0xEF24 + 8));
     mrrsc_log("at start");
     crx_log_memory_owners("before release", UINT32_MAX);
-    if (m50_crx_movrel && is_movie_mode()) { mrrsc_release(); if (movrel_n) rw_get(); }
+    if (is_movie_mode()) { mrrsc_release(); if (movrel_n) rw_get(); }
     if (rw_addr) crx_log_memory_owners("after RecWork grant", UINT32_MAX);
     save_log();
     for (int i = 0; i < 1000 && (writer_busy || jobs_in_flight()); i++) msleep(10);   /* previous recording */
-    int capture_test = m50_crx_capture_test;
-    if (capture_test && (!rw_addr || !record_native || pc_rowb || width < 3840 ||
-        rw_size < 3 * ((frame_bytes + 0xFFFF) & ~0xFFFFu) + 0x10000 + RING_TARGET))
-    {
-        LOG("Capture A/B needs uncropped 12-bit 4K and RecWork\n");
-        NotifyBox(4000, "Capture A/B needs uncropped 12-bit 4K and RecWork");
-        goto out;
-    }
-    upper_base = (m50_crx_upper || capture_test) ? upper_get() : 0;
+    upper_base = m50_crx_upper ? upper_get() : 0;
     if (stop_req) goto out;
-    if (capture_test && !upper_base)
-    {
-        NotifyBox(4000, "Capture A/B: upper buffer unavailable");
-        goto out;
-    }
-    uint32_t capture_base = capture_test == CAPTURE_RECWORK ? 0 : upper_base;
-    if (capture_test)
-    {
-        if (!drop_trace) drop_trace = malloc(DROP_TRACE_LIMIT * sizeof(*drop_trace));
-        if (!drop_trace) goto out;
-        LOG("Capture A/B: %s sinks, ring kept at RecWork baseline address and size\n",
-            capture_base ? "upper" : "RecWork");
-    }
-    if (!alloc_buffers(capture_base, capture_test)) { NotifyBox(4000, "CRX: not enough memory\n(see ML/LOGS/CRXREC*.LOG)"); goto out; }
+    if (!alloc_buffers(upper_base)) { NotifyBox(4000, "CRX: not enough memory\n(see ML/LOGS/CRXREC*.LOG)"); goto out; }
 
     if (record_native)
     {
@@ -2024,7 +1976,7 @@ static void crx_control(void *from_shutter)
         int (*get_speed)(uint32_t, int *, int *) = (void *) 0xE01E9E39;   /* storage API: speed mode + clock id */
         get_speed(*(volatile uint32_t *)(0xB130 + 0x10), &sp, &ck);
         LOG("test105: %s copy, ring %d MB; SD mode %d, clock %d, cache %d\n",
-            m50_crx_dma ? "DMA" : "CPU", ring_size >> 20, sp, ck, *(volatile uint32_t *) 0x19130);
+            "DMA", ring_size >> 20, sp, ck, *(volatile uint32_t *) 0x19130);
     }
     LOG("%s.CRX stream %dx%d pitch %d, encoded %dx%d (offset %d), %s %d-bit, black %d white %d, fps %d, repack core %d (alive %d)\n",
         fname, width, height, pitch, enc_w, enc_h, enc_off, m50_crx_mode ? "C-RAW" : "lossless",
@@ -2038,13 +1990,10 @@ static void crx_control(void *from_shutter)
         record_native ? "12-bit Live View hardware" : hwpack_active ? "hardware test" : "CPU repack", saved_pack,
         *(volatile uint32_t *) PACK_REG, *(volatile uint32_t *)(MEM1PATH_PACK_CFG + 12));
 
-    st_cpA_sum = st_cpA_n = st_cp_bad = st_cp_cpu = 0; cp_dma = m50_crx_dma; st_pc_max = st_pc_bad = st_pc_ovw = 0;
-    pc_n = m50_crx_startup_tests ? 0 : 3;
-    pc_m = m50_crx_dma && pl_prog ? 1 : 2;
+    st_cpA_sum = st_cpA_n = st_cp_bad = st_cp_cpu = 0; cp_dma = 1; st_pc_max = st_pc_bad = st_pc_ovw = 0;
+    pc_m = pl_prog ? 1 : 2;
     pc_allow_wide = record_native && pc_rowb;
     st_pc_wide = 0;
-    pc_t[0] = pc_t[1] = pc_t[2] = 0;
-    pc_ok[0] = pc_ok[1] = pc_ok[2] = 0;
     cp_state = 0; cp_h = 0; pending_h = 0;
     enc_posted = enc_taken = 0;
     LOG("stage 3: routing on\n");
@@ -2057,21 +2006,10 @@ static void crx_control(void *from_shutter)
     uint32_t capture_start = get_ms_clock();
     trace_count = trace_stage = trace_queue = trace_encode = trace_copy_wait = 0;
     trace_start = get_us_clock() - rec_t0_us;
-    trace_on = capture_test != CAPTURE_NORMAL;
-    rec_live = !m50_crx_startup_tests;
+    trace_on = 0;
+    rec_live = 1;
     asm volatile("dmb sy" ::: "memory");
     routing = 1;
-    if (!rec_live)
-    {
-        for (int i = 0; i < 60 && st_encoded < 3 && !stop_req; i++) msleep(50);
-        LOG("warm-up: %d encodes, %d drops\n", st_encoded, st_drop_worker);
-        st_hooked = st_drop_worker = st_drop_queue = st_encoded = 0;
-        warmup_drops = crx_camera_drop_count();
-        st_enc_bytes = 0; frame_counter = 0;
-        capture_start = get_ms_clock();
-        asm volatile("dmb sy" ::: "memory");
-        rec_live = 1;
-    }
 
     int t_last = get_ms_clock(), t_save = t_last; uint32_t w_last = 0, h_last = 0, e_last = 0, b_last = 0;
     uint32_t written_last = 0;
@@ -2183,18 +2121,12 @@ static void crx_control(void *from_shutter)
             st_enc_bytes >> 20, kbs / 1024, (kbs % 1024) * 10 / 1024,
             m50_crx_sample ? " (pipeline test: only 1 frame in 24 was written)" : "");
     }
-    static const char *pcn[3] = { "DMA per row (Canon)", "PL330", "CPU cached" };
     if (record_native) LOG("12-bit LV: %d frames during %d ms of capture, %d.%d fps\n",
         st_encoded, capture_ms, capture_ms ? st_encoded * 1000 / capture_ms : 0,
         capture_ms ? st_encoded * 10000 / capture_ms % 10 : 0);
     else if (record_bits == 12) LOG("12-bit conversion: last %d us\n", st_pc_us);
     if (m50_crx_qtest) LOG("C-RAW Q test %d: %d frames, stock high-band Q %d\n",
         m50_crx_qtest, qtest_frames, qtest_first);
-    if (pc_rowb && (record_native || record_bits == 14))
-        LOG("crop warm-up us: DMA %d (%s), PL330 %d (%s), CPU %d (%s), used %s\n",
-        pc_t[0], pc_t[0] ? (pc_ok[0] ? "ok" : "BAD") : "skipped",
-        pc_t[1], pc_t[1] ? (pc_ok[1] ? "ok" : "BAD") : "skipped",
-        pc_t[2], pc_t[2] ? (pc_ok[2] ? "ok" : "BAD") : "skipped", pcn[pc_m]);
     LOG("pre-crop: last %d us, max %d us, %d bad copies, %d source-changed\n", st_pc_us, st_pc_max, st_pc_bad, st_pc_ovw);
     if (record_native && pc_rowb)
         LOG("native crop: %d verified 8-byte DMA copies\n", st_pc_wide);
