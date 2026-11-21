@@ -1,0 +1,18 @@
+Magic Lantern M50 (fw 1.1.0) - source of test70
+================================================
+Toolchain: arm-none-eabi-gcc 13.2.1 (Debian/Ubuntu package gcc-arm-none-eabi 15:13.2.rel1-2), python3, make, zip, git not needed.
+
+Build:
+    cd ml/platform/M50.110
+    make            # -> build/autoexec.bin, build/M50_110.sym, build/magiclantern.zip
+
+Checks after every build (a wrong .bss silently breaks movie mode):
+    grep -E "^\.bss " build/location.map      # must say 0x00120000
+    grep "_data.end = " build/location.map    # must be below 0x00120000 (about 0xF600 bytes... currently 0x0011f629)
+
+IMPORTANT: copy autoexec.bin AND the matching M50_110.sym (build/M50_110.sym -> ML/modules/M50_110.sym)
+to the card together. A stale .sym from another build crashes the camera when entering movie mode.
+The files in /ML (fonts, modules, ...) come from build/magiclantern.zip; tools/pack.sh does exactly this.
+
+Main files for the CRX recorder:  platform/M50.110/crx_rec.c, sensor_tune.c, raw_vsync.c, bin_stub.c, RAW_VIDEO.md (all notes)
+The camera ROM dumps are NOT needed to build (only for reverse engineering).
