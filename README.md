@@ -8,12 +8,11 @@ Hardware-accelerated CRX (CR3 / C-RAW) RAW video recording on the **Canon EOS M5
   - Uses Canon's built-in DIGIC 8 CR3/C-RAW hardware encoder (`ALGS_REQUEST`) for real-time compressed RAW video.
   - **12-bit** (default) & **14-bit** capture, **C-RAW (lossy)** and **Lossless** modes, plus configurable C-RAW quantization strength.
   - **PL330 DMA multi-piece frame copy** and **3-buffer capture pipeline** for smooth continuous recording.
-  - **Crop modes** (with CMOS vertical row-window cropping in `sensor_crop.c`):
-    - Full stream (4K)
-    - `3.5K 3584x1504` (2.38:1) / `3.5K 3584x2016` (16:9)
-    - `3K 3072x1288` (2.38:1) / `3K 3072x1728` (16:9) — default
-    - `2.8K 2880x1200` (2.40:1)
-    - `2.5K 2560x1440` (16:9)
+  - **Aspect ratio** offers 16:9, 3:2 (M50 sensor shape), 4:3, 1:1, Scope (~2.39:1), and Full stream.
+  - **Resolution** shows the output dimensions for the selected shape. Widths include 720, 1024, HD (1280), Full HD (1920), and 2.5K, 2.8K, 3K, 3.2K, 3.4K, 3.5K, and 4K UHD (3840). Taller shapes offer the widths that fit within 2160 rows. The encoder uses multiples of eight rows.
+  - **C-RAW strength** offers Stock through +6. Cards with the former Max diagnostic setting start at Stock.
+  - **Full stream** keeps the original native capture option. **16:9 / 4K UHD** copies a 3840x2160 rectangle into the encoder input and stores exactly those dimensions in the CRX file.
+  - **SD speed test** writes a temporary 64 MiB file in 1 MiB blocks, shows the average sequential write speed in MB/s, and removes the file on completion.
   - **NTSC (23.98p) / PAL (25p) Video System toggle** directly from the CRX menu.
   - **Movie shutter button** start/stop recording and live recording HUD (buffer fill, write/need MB/s, SD & camera drop counters).
 - **`crx2dng` Desktop Converter (`crx2dng/`)**
@@ -25,7 +24,7 @@ Hardware-accelerated CRX (CR3 / C-RAW) RAW video recording on the **Canon EOS M5
 2. **Switch to Movie mode (4K):** Turn the mode dial to **Movie** and set Canon's movie recording size to **4K** (for crop modes) or **1080p**.
 3. **Configure CRX (optional):** Press the **Trash** button to open the Magic Lantern menu, then go to **Debug → CRX recording**.
    - Default settings are ready to shoot: **3K 3072×1728 (16:9)**, **12-bit**, **C-RAW (lossy)**, **Movie shutter = Start/stop CRX**.
-   - Use **Video system** to switch between **NTSC (23.98p)** and **PAL (25p)**, and **Crop** to pick another resolution.
+   - Use **Video system** to switch between **NTSC (23.98p)** and **PAL (25p)**, then open **Aspect ratio** or **Resolution** with **SET**, highlight a choice, and press **SET** to close the list. Close the menu to see the centered frame in Live View. The recorder crops the incoming RAW frame at the selected size.
 4. **Record:** Close the menu and wait for **`CRX READY`** on the Live View HUD. Press the **shutter button** to start recording, and press it again to stop.
 5. **Convert to CinemaDNG:** Copy the `.CRX` files from `ML/CRX/` on your SD card to your PC and drag-and-drop them onto `crx2dng/convert_to_resolve.bat` (or open them in `crx2dng_gui.exe`) to generate DaVinci Resolve–ready CinemaDNG folders.
 

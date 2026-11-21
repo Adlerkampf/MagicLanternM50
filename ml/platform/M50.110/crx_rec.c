@@ -72,6 +72,7 @@ CONFIG_INT("crx.hwpack", m50_crx_hwpack, 1);
 CONFIG_INT("crx.sample", m50_crx_sample, 0);
 CONFIG_INT("crx.qtest", m50_crx_qtest, 0);
 CONFIG_INT("crx.shutter", m50_crx_shutter, 1);
+static const uint8_t crx_quant_add[] = { 0, 2, 3, 4, 5, 6 };
 static volatile int qtest_active;
 static volatile uint32_t qtest_frames;
 static volatile uint8_t qtest_first;
@@ -86,18 +87,16 @@ void m50_crx_quant_load(void *config, uint32_t planes, uint32_t levels,
     uint8_t *descriptors = ((uint8_t **) config)[5];
     uint8_t saved[40];
     int strength = qtest_active;
-    int change = strength && planes == 4 && levels == 3 &&
+    int change = strength > 0 && strength < COUNT(crx_quant_add) && planes == 4 && levels == 3 &&
                  descriptors && *(const uint16_t *) descriptors == 0x0FF6;
     if (change)
     {
-        static const uint8_t qtest_add[] = { 0, 2, 3, 4, 5, 6 };
         for (int band = 0; band < 40; band++)
         {
             uint8_t *q = descriptors + band * 16 + 6;
             saved[band] = *q;
-            if (strength == 6) *q |= 0x7F;
-            else if (strength >= 1 && strength <= 5 && band % 10 >= 4)
-                *q = (*q & 0x80) | MIN((*q & 0x7F) + qtest_add[strength], 127);
+            if (band % 10 >= 4)
+                *q = (*q & 0x80) | MIN((*q & 0x7F) + crx_quant_add[strength], 127);
         }
         if (!qtest_frames) qtest_first = saved[9] & 0x7F;
         qtest_frames++;
@@ -115,8 +114,51 @@ static int record_native;
 volatile uint32_t m50_crx_native_pitch;
 #define SENSOR_MODE_NOW (*(volatile uint32_t *)(0xEF24 + 8))
 CONFIG_INT("crx.crop", m50_crx_crop, 4);
-static const uint16_t crop_w[] = { 0, 3584, 3584, 3072, 3072, 2880, 2560 }, crop_h[] = { 0, 1504, 2016, 1288, 1728, 1200, 1440 };
-static uint32_t enc_w, enc_h, enc_off, enc_fw;   /* encoder input size, byte offset of the crop in the sink, final width for the converter */
+/* crx.crop remains readable for cards configured by older builds. */
+CONFIG_INT("crx.aspect", crx_aspect, -1);
+CONFIG_INT("crx.resolution", crx_resolution, 4);
+
+enum { ASPECT_WIDE, ASPECT_SENSOR, ASPECT_STANDARD, ASPECT_SQUARE, ASPECT_SCOPE, ASPECT_STREAM };
+static const char *aspect_names[] = {
+    "16:9", "3:2 (M50 sensor)", "4:3", "1:1", "Scope (~2.39:1)", "Full stream"
+};
+static const struct { unsigned x, y; } aspects[] = {
+    {16, 9}, {3, 2}, {4, 3}, {1, 1}, {239, 100}, {0, 0}
+};
+/* Scope heights retain the existing recorder's three cinema crops. */
+static const struct { const char *name; unsigned width, scope_height; } resolutions[] = {
+    { "4K UHD", 3840, 1608 }, { "3.5K", 3584, 1504 }, { "3.4K", 3456, 1448 },
+    { "3.2K", 3200, 1336 }, { "3K", 3072, 1288 }, { "2.8K", 2880, 1200 },
+    { "2.5K", 2560, 1072 }, { "Full HD", 1920, 800 }, { "HD", 1280, 536 },
+    { "1K", 1024, 432 }, { "720 wide", 720, 304 }
+};
+
+static int format_height(int aspect, int resolution)
+{
+    if (aspect == ASPECT_STREAM) return 0;
+    if (aspect == ASPECT_SCOPE) return resolutions[resolution].scope_height;
+    unsigned x = aspects[aspect].x;
+    return 8 * ((resolutions[resolution].width * aspects[aspect].y + 4 * x) / (8 * x));
+}
+
+static void normalize_format(void)
+{
+    if (crx_aspect == -1)
+    {
+        static const uint8_t legacy[][2] = {
+            { ASPECT_STREAM, 0 }, { ASPECT_SCOPE, 1 }, { ASPECT_WIDE, 1 },
+            { ASPECT_SCOPE, 4 }, { ASPECT_WIDE, 4 }, { ASPECT_SCOPE, 5 }, { ASPECT_WIDE, 6 }
+        };
+        unsigned old = (unsigned)m50_crx_crop < COUNT(legacy) ? m50_crx_crop : 4;
+        crx_resolution = legacy[old][1];
+        crx_aspect = legacy[old][0];
+    }
+    if ((unsigned)crx_aspect >= COUNT(aspects)) crx_aspect = ASPECT_WIDE;
+    if ((unsigned)crx_resolution >= COUNT(resolutions)) crx_resolution = 4;
+    while (format_height(crx_aspect, crx_resolution) > 2160) crx_resolution++;
+}
+
+static uint32_t enc_w, enc_h, enc_off;   /* encoder input size and crop offset in the capture buffer */
 static uint32_t pc_x0b, pc_rowb;                 /* test67 pre-crop: byte offset of the crop's first column, bytes per cropped row */
 static uint8_t *pc_buf[2];                       /* cropped or 12-bit input per sink (stride == width) */
 static volatile uint32_t st_pc_us, st_pc_max, st_pc_bad;
@@ -124,7 +166,8 @@ static volatile int rec_live = 0;           /* 0 = encoder warm-up (first encode
 static volatile uint32_t st_enc_bytes = 0;  /* every encoded frame reaching the writer, written or not */                     /* 1: let the EDMAC pack unit write Canon packing */
 
 /* ---- state ---- */
-static volatile int rec_state = 0;          /* 0 idle, 1 starting, 2 recording, 3 stopping */
+enum { CRX_SD_TEST = 4 };
+static volatile int rec_state = 0;          /* 0 idle, 1 starting, 2 recording, 3 stopping, 4 SD write test */
 static volatile int routing = 0;            /* hook routes frames to us */
 static volatile int stop_req = 0;
 static volatile int encoder_stalled;
@@ -589,8 +632,17 @@ static void crx_worker(void *arg)
             else st_cache_bad++;
         }
         uint8_t *dst = (uint8_t *) CACHEABLE(encin[e]);
-        repack_blocks_ml_to_canon(rd, dst, frame_bytes / 14);
-        dcache_range(dst, frame_bytes, 1);      /* encoder DMA reads RAM */
+        uint32_t written = frame_bytes;
+        if (pc_rowb)
+        {
+            const uint8_t *row = (const uint8_t *)rd + enc_off;
+            for (uint32_t y = 0; y < enc_h; y++)
+                repack_blocks_ml_to_canon((const uint16_t *)(row + y * pitch),
+                                          dst + y * pc_rowb, pc_rowb / 14);
+            written = enc_h * pc_rowb;
+        }
+        else repack_blocks_ml_to_canon(rd, dst, frame_bytes / 14);
+        dcache_range(dst, written, 1);      /* encoder DMA reads RAM */
         uint64_t ts = sink_ts[idx];
         asm volatile("dmb sy" ::: "memory");
         worker_busy = 0;                        /* sink[idx] may be reused now */
@@ -634,6 +686,10 @@ static int pc_allow_wide;
 static unsigned st_pc_wide;
 /* PL330 crop program (Canon's Xdmac is an ARM PL330). */
 static uint8_t *pl_prog, *cp_prog;           /* PL330 program slots in RecWork (uncached) */
+/* Crop geometry is fixed for a take. Only the addresses, beat size and
+ * channel-specific epilogue can change between completed DMA jobs. */
+static int pl_last_channel = -1;
+static unsigned pl_last_beat;
 #define PL_CCR(beat_shift, len) (1 | ((beat_shift) << 1) | (((len) - 1) << 4) | (1 << 14) | ((beat_shift) << 15) | (((len) - 1) << 18) | 0x1C00700)
 static inline uint8_t *pl_mov(uint8_t *p, int rd, uint32_t v) { p[0] = 0xBC; p[1] = rd; p[2] = v; p[3] = v >> 8; p[4] = v >> 16; p[5] = v >> 24; return p + 6; }
 static int pl_build(uint8_t *dst, uint8_t *src, uint32_t spitch, uint32_t ch, uint32_t beat_shift)
@@ -672,8 +728,21 @@ static int pl_run(uint8_t *dst, uint8_t *src, uint32_t spitch, uint32_t beat_shi
     if (!slot) return -1;
     uint32_t ch = *slot;
     int r = -1;
-    if (ch < 4 && pl_build(dst, src, spitch, ch, beat_shift))
+    if (ch < 4)
     {
+        if ((int)ch != pl_last_channel || beat_shift != pl_last_beat)
+        {
+            pl_last_channel = -1;
+            if (!pl_build(dst, src, spitch, ch, beat_shift)) goto release;
+            pl_last_channel = ch;
+            pl_last_beat = beat_shift;
+        }
+        else
+        {
+            pl_mov(pl_prog, 0, (uint32_t)src);
+            pl_mov(pl_prog + 6, 2, (uint32_t)dst);
+            asm volatile("dsb sy" ::: "memory");
+        }
         void *sem = ((void **) 0x572DC)[ch];
         if (((int (*)(void *, int)) 0xE0577C5D)(sem, 0) == 0)
         {
@@ -687,6 +756,7 @@ static int pl_run(uint8_t *dst, uint8_t *src, uint32_t spitch, uint32_t beat_shi
             r = ((int (*)(uint32_t *, int)) 0xE0145BA3)(job, 1);
         }
     }
+release:
     ((void (*)(uint32_t *)) 0xE02E0685)(slot);
     return r;
 }
@@ -950,7 +1020,7 @@ static int pl_copy_pieces(uint8_t *d, uint32_t off, uint32_t n,
  * copy after the encoder returns, before publishing it to the writer. */
 static int fix_quant_header(uint8_t *p, uint32_t len, uint32_t tiles, int strength)
 {
-    static const uint8_t qtest_add[] = { 0, 2, 3, 4, 5, 6 };
+    if ((unsigned)strength >= COUNT(crx_quant_add)) return 0;
     uint32_t bands = 0;
     while (len >= 4)
     {
@@ -960,11 +1030,10 @@ static int fix_quant_header(uint8_t *p, uint32_t len, uint32_t tiles, int streng
         {
             uint32_t band = p[8] >> 4;
             if (band != bands % 10) return 0;
-            if (strength == 6 || band >= 4)
+            if (band >= 4)
             {
                 uint32_t q = ((p[8] & 7) << 5) | (p[9] >> 3);
-                uint32_t add = (strength >= 1 && strength <= 5) ? qtest_add[strength] : 0;
-                q = strength == 6 ? 127 : MIN(q + add, 127);
+                q = MIN(q + crx_quant_add[strength], 127);
                 p[8] = (p[8] & 0xF8) | (q >> 5);
                 p[9] = (p[9] & 7) | (q << 3);
             }
@@ -1095,7 +1164,13 @@ static void crx_encoder(void *unused)
         req.mode = m50_crx_mode ? 4 : 0;
         req.w = enc_w; req.h = enc_h; req.p3 = 0; req.p4 = 0; req.bits = record_bits;
         req.addr = (from_sink ? (uint32_t) sink[e] : (uint32_t) encin[e]) + enc_off; req.stride = width;
-        if (pc_rowb)
+        if (pc_rowb && !from_sink)
+        {
+            /* The CPU worker packed the selected Bayer rectangle directly. */
+            req.addr = (uint32_t)encin[e];
+            req.stride = enc_w;
+        }
+        else if (pc_rowb)
         {
             /* Finish any in-flight copier DMA before pre-crop touches Xdmac. */
             cp_wait_and_free();
@@ -1127,7 +1202,7 @@ static void crx_encoder(void *unused)
         enc_seq = seq;
         asm volatile("dmb sy" ::: "memory");
         uint32_t t0 = us_timer();
-        int quant = req.mode == 4 ? m50_crx_qtest : 0;
+        int quant = req.mode == 4 && (unsigned)m50_crx_qtest < COUNT(crx_quant_add) ? m50_crx_qtest : 0;
         uint32_t quant_loads = qtest_frames;
         qtest_active = quant;
         crx_algs_request(&req, 1, enc_cbr, (void *) seq);
@@ -1245,9 +1320,9 @@ static int open_chunk(void)
     h[17] = 128;                /* header size */
     h[18] = enc_w; h[19] = enc_h; h[20] = enc_off;   /* encoded area: full-width rows */
     if (record_bits == 12 && !record_native) h[20] = enc_off * 6 / 7;
-    h[21] = enc_fw;             /* final width for the converter (0 = all) */
+    h[21] = 0;                  /* retain the entire encoded width */
     h[10] = 0; h[12] = enc_h;   /* active area relative to the encoded rows (top OB is cut) */
-    if (pc_rowb) { h[9] = 0; h[11] = enc_w; h[21] = 0; }   /* pre-cropped: no OB left, nothing for the converter to cut */
+    if (pc_rowb) { h[9] = 0; h[11] = enc_w; }   /* pre-cropped: no OB left, nothing for the converter to cut */
     FIO_WriteFile(f, UNCACHEABLE(iobuf), 128);
     chunk_bytes = 128;
     return 1;
@@ -1260,10 +1335,12 @@ static void crx_writer(void *unused)
     {
         uint32_t w = r_wp, r = r_rp;
         if (r_wrap != 0xFFFFFFFF && r == r_wrap && w < r) { r_rp = r = 0; r_wrap = 0xFFFFFFFF; }
-        uint32_t avail = w >= r ? w - r : r_wrap - r;
+        int wrapped = (w < r);
+        uint32_t avail = wrapped ? r_wrap - r : w - r;
         if (!avail || !f) { if (!avail) { msleep(5); continue; } }
-        /* collect big writes: wait (max 400 ms) until 4 MB is there (test61: 1 MB writes ran at 25 instead of 30 MB/s) */
-        if (avail < (4u << 20) && !wr_flush && idle_ms < 400) { msleep(5); idle_ms += 5; continue; }
+        /* collect big writes: wait (max 400 ms) until 4 MB is there;
+         * never wait on a wrap tail because r_wrap - r cannot grow. */
+        if (!wrapped && avail < (4u << 20) && !wr_flush && idle_ms < 400) { msleep(5); idle_ms += 5; continue; }
         idle_ms = 0;
         uint32_t want = MIN(avail, WR_MAX);
         uint32_t au = chunk_bytes % WR_AU;
@@ -1332,6 +1409,10 @@ static const char *crx_start_blocker(void)
     if (m50_bin_enabled) return "Turn Full-sensor bin OFF";
     if (!lv) return "Live View needed";
     if (RECORDING) return "Another recorder is active";
+    normalize_format();
+    if (SENSOR_MODE_NOW == 6 && crx_aspect != ASPECT_STREAM &&
+        (resolutions[crx_resolution].width > 1992 || format_height(crx_aspect, crx_resolution) > 1128))
+        return "Select a smaller size or Canon 4K";
     if (m50_crx_depth == CRX_12BIT_LV)
     {
         if (!is_movie_mode()) return "Switch to movie mode for 12-bit LV";
@@ -1436,8 +1517,9 @@ static int alloc_buffers(uint32_t upper_base)
     if (!iobuf) iobuf = fio_malloc(4096);
     if (pc_rowb && !pc_buf[0])
     {
-        /* photo mode / no RecWork: no pre-crop buffers in the small pool -> no crop */
-        LOG("  no RecWork: crop off\n"); enc_w = width; enc_off = enc_off - pc_x0b; pc_x0b = pc_rowb = 0;
+        LOG("No memory for selected crop\n");
+        free_buffers();
+        return 0;
     }
     if (!ring)
     {
@@ -1766,17 +1848,25 @@ static void crx_control(void *from_shutter)
     {
         /* test67: crop = copy the rectangle into a compact buffer first (like mlv_lite does), then encode that with
          * stride == width (the encoder needs it; test62's stride != width gave broken frames). No crop: full-width rows,
-         * top optical black cut (test63). The sensor row window (test64/65) puts the read rows at the top. */
+         * top optical black cut (test63). Canon keeps the full readout for a live, centered software crop. */
         int ax1 = raw_info.active_area.x1, ay1 = raw_info.active_area.y1;
         uint32_t y0 = (ay1 + 3) & ~3;
-        enc_w = width; enc_h = (height - y0) & ~7; enc_fw = 0; pc_rowb = 0; pc_x0b = 0;
-        extern int m50_sensor_crop_rows(void);
-        int srows = m50_sensor_crop_rows();
-        uint32_t cw = crop_w[m50_crx_crop], ch = crop_h[m50_crx_crop];
-        if (m50_crx_crop && cw <= (uint32_t)(width - ax1) && ch <= enc_h)
+        enc_w = width; enc_h = (height - y0) & ~7; pc_rowb = 0; pc_x0b = 0;
+        normalize_format();
+        uint32_t cw = resolutions[crx_resolution].width, ch = format_height(crx_aspect, crx_resolution);
+        uint32_t right = MIN((uint32_t)width, (uint32_t)raw_info.active_area.x2);
+        if (ch && (right < cw + ax1 || ch > enc_h))
         {
-            if (!(srows && srows <= (int) enc_h)) y0 = (y0 + (enc_h - ch) / 2) & ~3;
-            uint32_t x0 = (ax1 + (width - ax1 - cw) / 2) & ~63;     /* 64 px = 112 bytes: 16-byte aligned */
+            NotifyBox(4000, "CRX: %dx%d exceeds this RAW stream", cw, ch);
+            goto out;
+        }
+        if (ch)
+        {
+            y0 = (y0 + (enc_h - ch) / 2) & ~3;
+            /* Retain the 64-pixel DMA alignment when the active area permits it. */
+            uint32_t x0 = (ax1 + (right - ax1 - cw) / 2) & ~63u;
+            if (x0 < (uint32_t)ax1) x0 = (ax1 + 15) & ~15u;
+            if (x0 + cw > right) { NotifyBox(4000, "CRX: crop alignment exceeds stream"); goto out; }
             enc_w = cw; enc_h = ch; pc_x0b = x0 * 14 / 8; pc_rowb = cw * 14 / 8;
         }
         enc_off = y0 * pitch + pc_x0b;
@@ -1797,7 +1887,8 @@ static void crx_control(void *from_shutter)
         frame_bytes = pitch * height;
     }
 
-    { extern int m50_sensor_crop_rows(void); LOG("sensor rows %d, encoded %dx%d from row %d%s\n", m50_sensor_crop_rows(), enc_w, enc_h, enc_off / pitch, pc_rowb ? " (pre-cropped)" : ""); }
+    LOG("CRX framing: encoded %dx%d, source row %d, column byte %d\n",
+        enc_w, enc_h, enc_off / pitch, pc_x0b);
     LOG("stage 1: stream %dx%d pitch %d, movie mode %d, sensor mode %d\n", width, height, pitch,
         is_movie_mode(), *(volatile uint32_t *)(0xEF24 + 8));
     mrrsc_log("at start");
@@ -1877,6 +1968,7 @@ static void crx_control(void *from_shutter)
         *(volatile uint32_t *) PACK_REG, *(volatile uint32_t *)(MEM1PATH_PACK_CFG + 12));
 
     st_cpA_sum = st_cpA_n = st_cp_bad = st_cp_cpu = 0; cp_dma = 1; st_pc_max = st_pc_bad = st_pc_ovw = 0;
+    pl_last_channel = -1;
     pc_m = pl_prog ? 1 : 2;
     pc_allow_wide = record_native && pc_rowb;
     st_pc_wide = 0;
@@ -1894,7 +1986,7 @@ static void crx_control(void *from_shutter)
     asm volatile("dmb sy" ::: "memory");
     routing = 1;
 
-    int t_last = get_ms_clock(), t_save = t_last; uint32_t w_last = 0, h_last = 0, e_last = 0, b_last = 0;
+    int t_last = get_ms_clock(); uint32_t w_last = 0, h_last = 0, e_last = 0, b_last = 0;
     uint32_t written_last = 0;
     extern uint32_t m50_daf_dma_programs(unsigned channel);
     uint32_t daf_a = m50_daf_dma_programs(0), daf_b = m50_daf_dma_programs(1);
@@ -1936,7 +2028,6 @@ static void crx_control(void *from_shutter)
             st_pc_max = st_enc_max = 0;
             t_last = now; w_last = st_written; h_last = st_hooked; e_last = encoded; b_last = encoded_bytes;
             written_last = written;
-            if (!writer_busy && now - t_save >= 5000) { t_save = now; save_log(); }   /* test49: every 5 s, never during a card write */
         }
         if (!lv) stop_req = 1;
     }
@@ -2024,24 +2115,150 @@ out:
     rec_state = 0;
 }
 
-static const char *crx_apply_sensor_crop(void)
+/* The native stream is also accessible from the 16:9 resolution list. */
+static int native_resolution_index = COUNT(resolutions);
+
+static MENU_SELECT_FUNC(aspect_select)
 {
-    /* test64: also narrow the sensor's row window (4K movie mode), so unread rows cost nothing */
-    extern const char *m50_sensor_crop_set(int rows);
-    return m50_sensor_crop_set(SENSOR_MODE_NOW == 12 ? crop_h[m50_crx_crop] : 0);
+    if (rec_state) return;
+    normalize_format();
+    crx_aspect = MOD(crx_aspect + delta, COUNT(aspects));
+    normalize_format();
+    if (SENSOR_MODE_NOW == 6 && crx_aspect != ASPECT_STREAM)
+        while (resolutions[crx_resolution].width > 1992 || format_height(crx_aspect, crx_resolution) > 1128)
+            crx_resolution++;
 }
 
-static void crx_set_crop(int crop)
+static MENU_SELECT_FUNC(resolution_select)
 {
-    m50_crx_crop = crop;
-    const char *err = crx_apply_sensor_crop();
-    if (err) NotifyBox(4000, "Sensor crop: %s\n(encoder crop only)", err);
-    else if (m50_crx_crop && SENSOR_MODE_NOW == 12) NotifyBox(4000, "Re-enter movie mode to apply sensor crop");
+    if (rec_state || !delta) return;
+    normalize_format();
+    int wide = crx_aspect == ASPECT_WIDE || crx_aspect == ASPECT_STREAM;
+    int index = crx_aspect == ASPECT_STREAM ? COUNT(resolutions) : crx_resolution;
+    do {
+        index = MOD(index + (delta > 0 ? 1 : -1), COUNT(resolutions) + wide);
+        if (index == COUNT(resolutions))
+        {
+            crx_aspect = ASPECT_STREAM;
+            return;
+        }
+    } while (format_height(wide ? ASPECT_WIDE : crx_aspect, index) > 2160);
+    if (wide) crx_aspect = ASPECT_WIDE;
+    crx_resolution = index;
 }
 
-static MENU_SELECT_FUNC(crop_select)
+static MENU_UPDATE_FUNC(aspect_update)
 {
-    crx_set_crop(MOD(m50_crx_crop + delta, COUNT(crop_w)));
+    normalize_format();
+    MENU_SET_VALUE("%s", aspect_names[crx_aspect]);
+}
+
+static MENU_UPDATE_FUNC(resolution_update)
+{
+    normalize_format();
+    static int cached_aspect = -1;
+    static char labels[COUNT(resolutions)][24];
+    static const char *choices[COUNT(resolutions) + 1];
+    int aspect = crx_aspect == ASPECT_STREAM ? ASPECT_WIDE : crx_aspect;
+    if (cached_aspect != aspect)
+    {
+        for (int i = 0; i < COUNT(resolutions); i++)
+        {
+            snprintf(labels[i], sizeof(labels[i]), "%s %dx%d", resolutions[i].name,
+                     resolutions[i].width, format_height(aspect, i));
+            choices[i] = labels[i];
+        }
+        choices[COUNT(resolutions)] = "Native stream";
+        cached_aspect = aspect;
+    }
+    int first = 0;
+    while (format_height(aspect, first) > 2160) first++;
+    entry->min = first;
+    entry->max = COUNT(resolutions) - 1 + (aspect == ASPECT_WIDE);
+    entry->priv = crx_aspect == ASPECT_STREAM ? &native_resolution_index : &crx_resolution;
+    entry->choices = choices + first;
+    entry->icon_type = IT_DICE;
+    MENU_SET_VALUE("%s", choices[MENU_INT(entry)]);
+}
+
+/* Claim the same idle state as the shutter and menu recording triggers. */
+static char sd_result[40] = "Start";
+static volatile unsigned sd_test_mib;
+
+static void sd_test_task(void *unused)
+{
+    const unsigned total = 64u << 20;
+    unsigned block = 4u << 20;
+    const char *path = "ML/CRXTEST.TMP";
+    const char *error = 0;
+    void *fio_buf = 0;
+    struct memSuite *suite = 0;
+    void *buffer = 0;
+    FILE *file = 0;
+    uint32_t size, elapsed = 0;
+    struct card_info *card = get_ml_card();
+    if (RECORDING) { error = "Stop Canon recording"; goto done; }
+    if (card->cluster_size > 0 && (uint64_t)(unsigned)card->free_space_raw * card->cluster_size < total + (1u << 20))
+    { error = "Need 65 MiB free"; goto done; }
+    if (FIO_GetFileSize(path, &size) == 0)
+    { error = "Move ML/CRXTEST.TMP first"; goto done; }
+    fio_buf = fio_malloc(block);
+    if (fio_buf) buffer = fio_buf;
+    else
+    {
+        suite = shoot_malloc_suite_contig(block);
+        if (suite) buffer = GetMemoryAddressOfMemoryChunk(GetFirstChunkFromSuite(suite));
+        else
+        {
+            block = 1u << 20;
+            fio_buf = fio_malloc(block);
+            buffer = fio_buf;
+        }
+    }
+    if (!buffer) { error = "No test buffer"; goto done; }
+    memset(buffer, 0x5a, block);
+    file = FIO_CreateFile(path);
+    if (!file) { error = "Cannot create test file"; goto done; }
+    uint32_t start = get_ms_clock();
+    for (unsigned written = 0; written < total; written += block)
+    {
+        if (RECORDING) { error = "Stopped for recording"; break; }
+        if (FIO_WriteFile(file, buffer, block) != (int)block) { error = "SD write failed"; break; }
+        sd_test_mib += block >> 20;
+    }
+    FIO_CloseFile(file);
+    elapsed = (uint32_t)get_ms_clock() - start;
+    if (!error && (!elapsed || FIO_GetFileSize(path, &size) || size != total))
+        error = "Incomplete speed test";
+    if (FIO_RemoveFile(path)) error = "Remove ML/CRXTEST.TMP";
+done:
+    if (fio_buf) fio_free(fio_buf);
+    if (suite) shoot_free_suite(suite);
+    if (error) snprintf(sd_result, sizeof(sd_result), "%s", error);
+    else
+    {
+        unsigned rate = total / 100 / elapsed; /* decimal MB/s, in tenths */
+        snprintf(sd_result, sizeof(sd_result), "%d.%d MB/s write", rate / 10, rate % 10);
+    }
+    NotifyBox(3500, "SD speed test: %s", sd_result);
+    __sync_lock_release(&rec_state);
+}
+
+static MENU_SELECT_FUNC(sd_test_select)
+{
+    if (RECORDING || !__sync_bool_compare_and_swap(&rec_state, 0, CRX_SD_TEST)) return;
+    sd_test_mib = 0;
+    if (task_create("crx_sd_test", 0x1c, 0x1800, sd_test_task, 0) & 1)
+    {
+        snprintf(sd_result, sizeof(sd_result), "Cannot start test");
+        __sync_lock_release(&rec_state);
+    }
+}
+
+static MENU_UPDATE_FUNC(sd_test_update)
+{
+    if (rec_state == CRX_SD_TEST) MENU_SET_VALUE("Writing %d/64 MiB", sd_test_mib);
+    else MENU_SET_VALUE("%s", sd_result);
 }
 
 static MENU_SELECT_FUNC(crx_reset_settings)
@@ -2055,7 +2272,8 @@ static MENU_SELECT_FUNC(crx_reset_settings)
     };
     for (unsigned i = 0; i < COUNT(settings); i++)
         *settings[i]->value = settings[i]->default_value;
-    if (m50_crx_crop != 4) crx_set_crop(4);
+    crx_aspect = ASPECT_WIDE;
+    crx_resolution = 4;
     NotifyBox(2000, "CRX settings reset");
 }
 
@@ -2173,7 +2391,7 @@ static void crx_physical_switch(uint32_t id, uint32_t pressed)
 static MENU_UPDATE_FUNC(crx_update)
 {
     static const char *s[] = { "Start", "starting...", "STOP (recording)", "stopping..." };
-    MENU_SET_VALUE("%s", s[rec_state & 3]);
+    MENU_SET_VALUE("%s", rec_state == CRX_SD_TEST ? "SD test running" : s[rec_state & 3]);
     MENU_SET_RINFO("%d fr, %d MB", st_written, st_bytes_out >> 20);
     MENU_SET_HELP("Files in ML/CRX. Logs in ML/LOGS.");
 }
@@ -2224,17 +2442,52 @@ static void crx_draw_buffer_graph(int x, int y, int width, const uint8_t *histor
     }
 }
 
+/* Panel coordinates are 720x480 on the M50. Scale both axes with the
+ * same factor so a square RAW frame has a square Live View opening. */
+struct crx_matte { int left, top, right, bottom, image_top, image_bottom; };
+
+static struct crx_matte crx_preview_matte(int mode)
+{
+    struct crx_matte m = {0};
+    if (crx_aspect == ASPECT_STREAM || (mode != 6 && mode != 12) || lv_dispsize > 1) return m;
+    int source_w = mode == 12 ? 3840 : 1920;
+    int source_h = source_w * 9 / 16;
+    int width = resolutions[crx_resolution].width;
+    int height = format_height(crx_aspect, crx_resolution);
+    if (width > source_w || height > source_h) return m;
+    int display_w = os.x_ex;
+    int display_h = display_w * 9 / 16;
+    if (display_w <= 0 || display_h > os.y_ex) return m;
+    m.image_top = os.y0 + (os.y_ex - display_h) / 2;
+    m.image_bottom = m.image_top + display_h;
+    int w = width * display_w / source_w, h = height * display_w / source_w;
+    m.left = os.x0 + (display_w - w) / 2;
+    m.right = m.left + w;
+    m.top = m.image_top + (display_h - h) / 2;
+    m.bottom = m.top + h;
+    return m;
+}
+
+static void crx_paint_matte(struct crx_matte m, int color)
+{
+    if (!m.image_bottom) return;
+    if (m.top > m.image_top) bmp_fill(color, os.x0, m.image_top, os.x_ex, m.top - m.image_top);
+    if (m.bottom < m.image_bottom) bmp_fill(color, os.x0, m.bottom, os.x_ex, m.image_bottom - m.bottom);
+    if (m.left > os.x0) bmp_fill(color, os.x0, m.top, m.left - os.x0, m.bottom - m.top);
+    if (m.right < os.x_max) bmp_fill(color, m.right, m.top, os.x_max - m.right, m.bottom - m.top);
+}
+
 static void crx_overlay_task(void *unused)
 {
     /* The startup task reads magic.cfg before creating this task. */
-    if ((unsigned)m50_crx_crop >= COUNT(crop_w)) m50_crx_crop = 0;
+    normalize_format();
     if ((unsigned)m50_crx_depth > CRX_12BIT_LV) m50_crx_depth = CRX_12BIT_LV;
-    if ((unsigned)m50_crx_qtest > 6) m50_crx_qtest = 0;
-    int saved_crop = m50_crx_crop;
+    if ((unsigned)m50_crx_qtest >= COUNT(crx_quant_add)) m50_crx_qtest = 0;
     enum { PAD = 9, GAP = 4 };
     uint8_t history[CRX_GRAPH_SAMPLES];
     int count = 0, next = 0;
     uint32_t previous_sd_drops = 0, previous_camera_drops = 0;
+    struct crx_matte previous_matte = {0};
     int old_x = 0, old_y = 0, old_w = 0, old_h = 0;
     for (;;)
     {
@@ -2271,13 +2524,16 @@ static void crx_overlay_task(void *unused)
         if (!LV_NON_PAUSED || (!state && !is_movie_mode()) ||
             gui_menu_shown() || gui_state != GUISTATE_IDLE)
         {
+            if (previous_matte.image_bottom)
+            {
+                AcquireRecursiveLock(bmp_lock, 0);
+                crx_paint_matte(previous_matte, COLOR_EMPTY);
+                ReleaseRecursiveLock(bmp_lock);
+                previous_matte = (struct crx_matte){0};
+                redraw();
+            }
             if (old_w) { old_w = 0; redraw(); }
             continue;
-        }
-        if (saved_crop && !state && SENSOR_MODE_NOW == 12 && !crx_start_blocker())
-        {
-            if (m50_crx_crop == saved_crop) crx_apply_sensor_crop();
-            saved_crop = 0;
         }
         char title[80], detail[52], rates[52];
         int title_color = COLOR_WHITE;
@@ -2297,6 +2553,8 @@ static void crx_overlay_task(void *unused)
                 snprintf(rates, sizeof(rates), "Write %d.%d MB/s  |  Need ~%d.%d MB/s",
                          write / 10, write % 10, need / 10, need % 10);
         }
+        else if (state == CRX_SD_TEST)
+            snprintf(title, sizeof(title), "SD speed test  |  %d/64 MiB", sd_test_mib);
         else if (state == 3)
             snprintf(title, sizeof(title), "CRX Saving...  |  Total dropped: %d", crx_take_drops());
         else if (state)
@@ -2311,13 +2569,10 @@ static void crx_overlay_task(void *unused)
             }
             else
             {
-                const char *size = "Full stream";
-                if (SENSOR_MODE_NOW == 12)
-                {
-                    static const char *const sizes[] = { "4K", "3.5K", "3.5K 16:9", "3K", "3K 16:9", "2.8K", "2.5K 16:9" };
-                    size = sizes[m50_crx_crop];
-                }
-                else if (SENSOR_MODE_NOW == 6) size = "1080p";
+                char size[32];
+                if (crx_aspect == ASPECT_STREAM) snprintf(size, sizeof(size), "Full stream");
+                else snprintf(size, sizeof(size), "%dx%d", resolutions[crx_resolution].width,
+                              format_height(crx_aspect, crx_resolution));
                 snprintf(title, sizeof(title), "CRX READY  |  %s  |  %d-bit  |  %s",
                          size, m50_crx_depth == CRX_14BIT ? 14 : 12, m50_crx_mode ? "C-RAW" : "Lossless");
             }
@@ -2341,6 +2596,11 @@ static void crx_overlay_task(void *unused)
         AcquireRecursiveLock(bmp_lock, 0);
         if (old_w && (x != old_x || y != old_y || w != old_w || h != old_h))
             crx_fill_panel(COLOR_EMPTY, old_x, old_y, old_w, old_h);
+        struct crx_matte matte = crx_preview_matte(SENSOR_MODE_NOW);
+        if (memcmp(&matte, &previous_matte, sizeof(matte)))
+            crx_paint_matte(previous_matte, COLOR_EMPTY);
+        crx_paint_matte(matte, COLOR_BLACK);
+        previous_matte = matte;
         crx_fill_panel(bg, x, y, w, h);
         int tx = x + (w - title_width) / 2;
         int ty = y + PAD;
@@ -2384,6 +2644,12 @@ static struct menu_entry crx_menu[] = {
         .help = "RAW video via Canon's CR3 encoder.",
         .children = (struct menu_entry[]) {
             { .name = "Record",        .select = crx_toggle, .update = crx_update },
+            { .name = "Aspect ratio", .priv = &crx_aspect, .choices = aspect_names,
+              .max = COUNT(aspects) - 1, .select = aspect_select, .update = aspect_update,
+              .help = "Choose the frame shape. Full stream keeps all available columns." },
+            { .name = "Resolution", .priv = &crx_resolution, .icon_type = IT_DICE,
+              .max = COUNT(resolutions) - 1, .select = resolution_select, .update = resolution_update,
+              .help = "SET opens sizes. Close the menu to see the selected frame." },
             { .name = "Movie shutter", .priv = &m50_crx_shutter, .max = 1,
               .choices = CHOICES("Canon", "Start/stop CRX") },
             { .name = "Upper buffer",  .priv = &m50_crx_upper, .max = 1,
@@ -2392,9 +2658,9 @@ static struct menu_entry crx_menu[] = {
             { .name = "Compression",   .priv = &m50_crx_mode, .max = 1,
               .choices = CHOICES("Lossless", "C-RAW (lossy)"),
               .help = "C-RAW reduces detail and file size." },
-            { .name = "C-RAW strength", .priv = &m50_crx_qtest, .max = 6,
-              .choices = CHOICES("Stock", "+2", "+3", "+4", "+5", "+6", "Max (127)"),
-              .help = "Adds +2..+6 to high-band Q to cut bitrate. Max=127 test." },
+            { .name = "C-RAW strength", .priv = &m50_crx_qtest, .max = COUNT(crx_quant_add) - 1,
+              .choices = CHOICES("Stock", "+2", "+3", "+4", "+5", "+6"),
+              .help = "Adds +2..+6 to high-band Q to cut bitrate." },
             { .name = "Video system", .priv = &m50_crx_vsys, .max = 1,
               .choices = CHOICES("NTSC (23.98p)", "PAL (25p)"),
               .select = crx_video_system_select, .update = crx_video_system_update,
@@ -2408,11 +2674,10 @@ static struct menu_entry crx_menu[] = {
             { .name = "Packing",       .priv = &m50_crx_hwpack, .max = 1,
               .choices = CHOICES("CPU repack", "Hardware (auto-check)"),
               .help = "Falls back to CPU if the check fails." },
-            { .name = "Crop", .priv = &m50_crx_crop, .max = 6, .select = crop_select,
-              .choices = CHOICES("Full stream", "3.5K 3584x1504", "3.5K 3584x2016", "3K 3072x1288", "3K 3072x1728", "2.8K 2880x1200", "2.5K 2560x1440"),
-              .help = "Crop before encoding." },
             { .name = "Repack on core", .priv = &m50_crx_core, .max = 1,
               .choices = CHOICES("main (0)", "second (1)") },
+            { .name = "SD speed test", .select = sd_test_select, .update = sd_test_update,
+              .help = "Measure sequential write speed with a temporary 64 MiB file." },
             { .name = "Reset settings", .select = crx_reset_settings },
             MENU_EOL,
         },
