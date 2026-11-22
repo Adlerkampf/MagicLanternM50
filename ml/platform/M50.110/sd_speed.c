@@ -51,6 +51,7 @@
 #define SD_SET_CLOCK    0xE01E8953      /* (card, clock code), Thumb */
 #define SD_TUNE         0xE01EB071      /* (card), Thumb */
 #define SD_GET_SPEED    0xE01E9E39      /* (card, int *speed, int *clock), Thumb */
+#define SD0_PIN_BASE    0xD0130128u     /* 6 DIGIC 8 GPIO regs: DAT0..3, CMD, CLK (bits [5:4] = drive strength) */
 #define CLK_195         9
 
 #define CARDPLL_CTRL    (*(volatile uint32_t *)0xD010F218)
@@ -60,6 +61,7 @@
 
 static const int sd_oc_n[] = { 0, 65, 80, 92, 96, 100, 104, 108, 112 };
 static CONFIG_INT("sd.m50_clock_preset", sd_oc_preset, 4);  /* default: 288 MHz (auto-recovers & steps down on brake) */
+static CONFIG_INT("sd.m50_pin_drive", sd_pin_drive, 0);     /* 0=Middle(stock), 1=High, 2=Max, 3=Low */
 
 static int sd_apply_state = 0;  /* 0 idle, 1 running, 2 OK, 3 failed (reverted) */
 static int sd_active_idx = 0;   /* currently active index into sd_oc_n[] */
@@ -70,6 +72,7 @@ static int sd_brake_ts[4];      /* get_ms_clock() timestamps of recent hits */
 static int sd_brake_dead = 0;   /* 1 if 1.8V UHS-I restore failed */
 static volatile uint32_t sd_intercept_count = 0; /* brakes intercepted inside SDDRV ioctl(0x1004) */
 static volatile int sd_intercept_stepdown_mhz = 0;
+static volatile int sd_verify_braked = 0;
 static int sd_ioctl_hooked = 0;
 static char sd_apply_rinfo[24] = "";
 
@@ -104,11 +107,40 @@ static void pll_set_raw(int N)
     msleep(1);
 }
 
+static void apply_sd_pin_drive(void)
+{
+    /* DIGIC 8 0xD013xxxx GPIO atomic SET (low 16) / CLEAR (high 16) masks for bits [5:4]:
+     *   0x00200010 = Middle (stock), 0x00100020 = High, 0x00000030 = Max, 0x00300000 = Low
+     * Pins i=0..4 (0xD0130128..38) = DAT0..3 + CMD (pull-up); i=5 (0xD013013C) = SD_CLK (no pull). */
+    static const uint32_t data_masks[6] = {
+        0x00200010u, /* 0: Middle (stock) */
+        0x00100020u, /* 1: High (all) */
+        0x00100020u, /* 2: High (data only) */
+        0x00000030u, /* 3: Max (data only) */
+        0x00000030u, /* 4: Max (all) */
+        0x00300000u, /* 5: Low (all) */
+    };
+    static const uint32_t clk_masks[6] = {
+        0x00200010u, /* 0: Middle (stock) */
+        0x00100020u, /* 1: High (all) */
+        0x00200010u, /* 2: High (data only) -> CLK stays Middle */
+        0x00200010u, /* 3: Max (data only)  -> CLK stays Middle */
+        0x00000030u, /* 4: Max (all) */
+        0x00300000u, /* 5: Low (all) */
+    };
+    int mode = (unsigned)sd_pin_drive < 6 ? sd_pin_drive : 0;
+    for (int i = 0; i < 5; i++)
+        *(volatile uint32_t *)(SD0_PIN_BASE + (uint32_t)i * 4u) = data_masks[mode];
+    *(volatile uint32_t *)(SD0_PIN_BASE + 5u * 4u) = clk_masks[mode];
+    asm volatile("dmb sy" ::: "memory");
+}
+
 static int pll_set_and_tune(uint32_t card, int N)
 {
     int (*set_clock)(uint32_t, int) = (void *) SD_SET_CLOCK;
     int (*tune)(uint32_t) = (void *) SD_TUNE;
 
+    apply_sd_pin_drive();
     pll_set_raw(N);
     if (set_clock(card, CLK_195) & 1) return -1;
     if (tune(card) & 1) return -2;
@@ -167,6 +199,13 @@ static int sd_power_cycle_to_uhs(void)
 static int sd_ioctl_hook(uint32_t a0, uint32_t cmd, uint32_t a2)
 {
     int (*orig)(uint32_t, uint32_t, uint32_t) = (void *) SD_IOCTL_ORIG;
+    if (cmd == SD_IOCTL_PC_CMD && sd_apply_state == 1)
+    {
+        /* Brake tripped during quick_verify_4mb() in Prefs: mark verify failed and restore 1.8V stock */
+        sd_verify_braked = 1;
+        if (sd_power_cycle_to_uhs()) return 0;
+        return orig(a0, cmd, a2);
+    }
     if (cmd == SD_IOCTL_PC_CMD && sd_active_idx > 1 && !sd_brake_dead)
     {
         uint32_t dev = SD_PSTGDEV_PTR;
@@ -191,9 +230,28 @@ static int sd_ioctl_hook(uint32_t a0, uint32_t cmd, uint32_t a2)
                 stepped = 1;
             }
 
+            int target_n = sd_oc_n[sd_active_idx];
+            /* Try ~5 ms in-place re-tune WITHOUT power-cycling first (if still in 1.8V UHS-I).
+             * Only fall back to a full 1.8V power-cycle if CMD19 tuning fails! */
+            if (read_clock() <= CLK_195 && pll_set_and_tune(card, target_n) == 0)
+            {
+                sd_active_mhz = current_pll_mhz();
+                sd_intercept_count++;
+                if (stepped)
+                {
+                    sd_intercept_stepdown_mhz = sd_active_mhz;
+                    snprintf(sd_apply_rinfo, sizeof(sd_apply_rinfo), "brake->%dM", sd_active_mhz);
+                    NotifyBox(3500, "SD brake x4 -> %d MHz (5ms)", sd_active_mhz);
+                }
+                else
+                {
+                    NotifyBox(2000, "SD brake #%d/3 -> %d MHz (5ms)", sd_brake_hits, sd_active_mhz);
+                }
+                return 0;
+            }
+
             if (sd_power_cycle_to_uhs())
             {
-                int target_n = sd_oc_n[sd_active_idx];
                 if (pll_set_and_tune(card, target_n) == 0)
                 {
                     sd_active_mhz = current_pll_mhz();
@@ -202,11 +260,11 @@ static int sd_ioctl_hook(uint32_t a0, uint32_t cmd, uint32_t a2)
                     {
                         sd_intercept_stepdown_mhz = sd_active_mhz;
                         snprintf(sd_apply_rinfo, sizeof(sd_apply_rinfo), "brake->%dM", sd_active_mhz);
-                        NotifyBox(3500, "SD brake x4 -> %d MHz (fast)", sd_active_mhz);
+                        NotifyBox(3500, "SD brake x4 -> %d MHz (pc)", sd_active_mhz);
                     }
                     else
                     {
-                        NotifyBox(2000, "SD brake #%d/3 -> %d MHz (fast)", sd_brake_hits, sd_active_mhz);
+                        NotifyBox(2000, "SD brake #%d/3 -> %d MHz (pc)", sd_brake_hits, sd_active_mhz);
                     }
                     return 0;
                 }
@@ -220,7 +278,7 @@ static int sd_ioctl_hook(uint32_t a0, uint32_t cmd, uint32_t a2)
                         sd_intercept_count++;
                         sd_intercept_stepdown_mhz = sd_active_mhz;
                         snprintf(sd_apply_rinfo, sizeof(sd_apply_rinfo), "brake->%dM", sd_active_mhz);
-                        NotifyBox(3500, "SD brake -> %d MHz (fast)", sd_active_mhz);
+                        NotifyBox(3500, "SD brake -> %d MHz (pc)", sd_active_mhz);
                         return 0;
                     }
                 }
@@ -275,14 +333,15 @@ static int quick_verify_4mb(void)
     for (uint32_t i = 0; i < sz / 4; i++) wp[i] = 0x5A3C0000u ^ (i * 0x9E3779B1u);
 
     int ok = 1;
+    sd_verify_braked = 0;
     FILE *f = FIO_CreateFile(SDCHK_TMP_FILE);
-    if (!f || FIO_WriteFile(f, wbuf, sz) != (int)sz) ok = 0;
+    if (!f || FIO_WriteFile(f, wbuf, sz) != (int)sz || sd_verify_braked) ok = 0;
     if (f) FIO_CloseFile(f);
 
     if (ok)
     {
         FILE *rf = FIO_OpenFile(SDCHK_TMP_FILE, O_RDONLY | O_SYNC);
-        if (!rf || FIO_ReadFile(rf, rbuf, sz) != (int)sz) ok = 0;
+        if (!rf || FIO_ReadFile(rf, rbuf, sz) != (int)sz || sd_verify_braked) ok = 0;
         if (rf) FIO_CloseFile(rf);
         if (ok)
         {
@@ -308,6 +367,7 @@ static void sd_apply_task(void *is_boot)
     msleep(is_boot ? 2500 : 200);
 
     uint32_t card = SD_CARD;
+    sd_install_ioctl_hook();
     int idx = sd_oc_preset;
     if (idx < 0 || idx >= (int)COUNT(sd_oc_n)) idx = (int)COUNT(sd_oc_n) - 1;
 
@@ -337,18 +397,23 @@ static void sd_apply_task(void *is_boot)
         return;
     }
 
-    /* Try requested preset, stepping down through lower presets if tuning or 4 MiB verify fails */
+    /* Try requested preset (up to 2 attempts per step), stepping down if tuning or 4 MiB verify fails */
     int tried_idx = idx;
     int ok = 0;
-    while (tried_idx >= 1)
+    while (tried_idx >= 1 && !ok)
     {
         int n = sd_oc_n[tried_idx];
-        if (pll_set_and_tune(card, n) == 0 && (n <= 65 || quick_verify_4mb()))
+        for (int attempt = 0; attempt < 2; attempt++)
         {
-            ok = 1;
-            break;
+            if (read_clock() >= 10 && !sd_power_cycle_to_uhs())
+                break;
+            if (pll_set_and_tune(card, n) == 0 && (n <= 65 || quick_verify_4mb()))
+            {
+                ok = 1;
+                break;
+            }
         }
-        tried_idx--;
+        if (!ok) tried_idx--;
     }
 
     if (!ok)
@@ -520,6 +585,17 @@ static MENU_SELECT_FUNC(sd_preset_select)
     }
 }
 
+static MENU_SELECT_FUNC(sd_drive_select)
+{
+    menu_numeric_toggle(priv, delta, 0, 5);
+    if (sd_apply_state != 1 && NOT_RECORDING)
+    {
+        sd_apply_state = 1;
+        sd_apply_rinfo[0] = 0;
+        task_create("m50_sdclk", 0x1c, 0x1000, sd_apply_task, 0);
+    }
+}
+
 static struct menu_entry sd195_menu[] = {
     {
         .name = "SD card mode",
@@ -532,6 +608,14 @@ static struct menu_entry sd195_menu[] = {
         .max = COUNT(sd_oc_n) - 1,
         .choices = CHOICES("OFF (156 MHz)", "195 MHz (safe)", "240 MHz (OC)", "276 MHz (OC)", "288 MHz (OC)", "300 MHz (OC)", "312 MHz (OC)", "324 MHz (OC)", "336 MHz (max OC)"),
         .help = "Target SD bus clock via DIGIC 8 CARDPLL (0xD010F218). Auto-applies on boot & auto-steps down if card fails verify.",
+    },
+    {
+        .name = "SD pin drive",
+        .priv = &sd_pin_drive,
+        .select = sd_drive_select,
+        .max = 5,
+        .choices = CHOICES("Middle (stock)", "High (all)", "High (data only)", "Max (data only)", "Max (all)", "Low (all)"),
+        .help = "DIGIC 8 SD0 pin drive (0xD0130128..3C). 'data only' boosts DAT0..3+CMD while keeping SD_CLK clean at Middle.",
     },
     {
         .name = "Apply SD clock",
