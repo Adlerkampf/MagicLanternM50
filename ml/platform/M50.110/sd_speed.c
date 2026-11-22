@@ -37,6 +37,9 @@
 #define SD_UHS_HOST     (*(volatile uint32_t *)(0xB130 + 0x14))   /* 1=UHS-I host enabled, 0=disabled by Canon brake (0xE0173CFC) */
 #define SD_INIT_MODE    (*(volatile uint32_t *)(0xB130 + 0x30))   /* 0=UHS-I (SdCARDInitialize), 1=Legacy 3.3V, 2=UHS-II */
 #define SD_UHS_ENABLE(c) (*(volatile uint32_t *)(0xB1CC + (c) * 4)) /* 0=3.3V only, 1=1.8V UHS-I, 2=UHS-II */
+#define SD_PSTGDEV_PTR  (*(volatile uint32_t *)0x115B8)           /* pStgDev struct in RAM; +0x18 = ioctl fn ptr, +0x50 = bPowerDown */
+#define SD_IOCTL_ORIG   0xE017EEE1u                               /* Canon SDDRV ioctl handler (Thumb) */
+#define SD_IOCTL_PC_CMD 0x1004u                                   /* DEVICE_POWER_CYCLE ioctl command */
 #define SD_UHS_TUNE     0xE0173F17      /* (int), Thumb */
 /* Canon's DEVICE_POWER_CYCLE (0xE017EEB8) first calls 0xE0173CFC which sets SD_UHS_HOST=0!
  * Calling its 5 inner steps directly with SD_UHS_HOST=1 power-cycles the SD slot BACK into 1.8V UHS-I. */
@@ -61,10 +64,13 @@ static CONFIG_INT("sd.m50_clock_preset", sd_oc_preset, 4);  /* default: 288 MHz 
 static int sd_apply_state = 0;  /* 0 idle, 1 running, 2 OK, 3 failed (reverted) */
 static int sd_active_idx = 0;   /* currently active index into sd_oc_n[] */
 static int sd_active_mhz = 0;
-#define SD_BRAKE_WINDOW_MS 60000 /* 4 hits within 60 s triggers 1-notch step-down */
+#define SD_BRAKE_WINDOW_MS 30000 /* 4 hits within 30 s triggers 1-notch step-down */
 static int sd_brake_hits = 0;   /* brake hits inside current sliding window */
 static int sd_brake_ts[4];      /* get_ms_clock() timestamps of recent hits */
 static int sd_brake_dead = 0;   /* 1 if 1.8V UHS-I restore failed */
+static volatile uint32_t sd_intercept_count = 0; /* brakes intercepted inside SDDRV ioctl(0x1004) */
+static volatile int sd_intercept_stepdown_mhz = 0;
+static int sd_ioctl_hooked = 0;
 static char sd_apply_rinfo[24] = "";
 
 static int read_clock(void)
@@ -152,6 +158,95 @@ static int sd_power_cycle_to_uhs(void)
     sd_last_pc_clock = clock;
     return (speed >= 2 && clock <= CLK_195);
 }
+
+/* Intercept Canon's SDDRV ioctl(dev, 0x1004, arg) (DEVICE_POWER_CYCLE) in RAM!
+ * Normally Canon's brake calls 0xE0173CFC (UHSHost=0 -> 3.3V 48 MHz), finishes the 16 MiB
+ * write at 22 MB/s (~700 ms), then crx_writer had to split the file and power-cycle a 2nd time
+ * (~1.8 s total). Intercepting 0x1004 keeps UHSHost=1, runs ONE clean 1.8V power-cycle + re-tune
+ * (~300 ms), and lets Canon's retry finish at full 130+ MB/s with ZERO file split! */
+static int sd_ioctl_hook(uint32_t a0, uint32_t cmd, uint32_t a2)
+{
+    int (*orig)(uint32_t, uint32_t, uint32_t) = (void *) SD_IOCTL_ORIG;
+    if (cmd == SD_IOCTL_PC_CMD && sd_active_idx > 1 && !sd_brake_dead)
+    {
+        uint32_t dev = SD_PSTGDEV_PTR;
+        if (dev && *(volatile uint32_t *)(dev + 0x50) == 0) /* bPowerDown == 0 */
+        {
+            uint32_t card = SD_CARD;
+            int now_ms = get_ms_clock();
+            int kept = 0;
+            for (int i = 0; i < sd_brake_hits && i < 4; i++)
+            {
+                if ((uint32_t)(now_ms - sd_brake_ts[i]) <= SD_BRAKE_WINDOW_MS)
+                    sd_brake_ts[kept++] = sd_brake_ts[i];
+            }
+            if (kept < 4) sd_brake_ts[kept++] = now_ms;
+            sd_brake_hits = kept;
+
+            int stepped = 0;
+            if (sd_brake_hits >= 4 && sd_active_idx > 1)
+            {
+                sd_active_idx--;
+                sd_brake_hits = 0;
+                stepped = 1;
+            }
+
+            if (sd_power_cycle_to_uhs())
+            {
+                int target_n = sd_oc_n[sd_active_idx];
+                if (pll_set_and_tune(card, target_n) == 0)
+                {
+                    sd_active_mhz = current_pll_mhz();
+                    sd_intercept_count++;
+                    if (stepped)
+                    {
+                        sd_intercept_stepdown_mhz = sd_active_mhz;
+                        snprintf(sd_apply_rinfo, sizeof(sd_apply_rinfo), "brake->%dM", sd_active_mhz);
+                        NotifyBox(3500, "SD brake x4 -> %d MHz (fast)", sd_active_mhz);
+                    }
+                    else
+                    {
+                        NotifyBox(2000, "SD brake #%d/3 -> %d MHz (fast)", sd_brake_hits, sd_active_mhz);
+                    }
+                    return 0;
+                }
+                while (sd_active_idx > 1)
+                {
+                    sd_active_idx--;
+                    if (pll_set_and_tune(card, sd_oc_n[sd_active_idx]) == 0)
+                    {
+                        sd_active_mhz = current_pll_mhz();
+                        sd_brake_hits = 0;
+                        sd_intercept_count++;
+                        sd_intercept_stepdown_mhz = sd_active_mhz;
+                        snprintf(sd_apply_rinfo, sizeof(sd_apply_rinfo), "brake->%dM", sd_active_mhz);
+                        NotifyBox(3500, "SD brake -> %d MHz (fast)", sd_active_mhz);
+                        return 0;
+                    }
+                }
+            }
+            /* Fallback: let Canon's stock DEVICE_POWER_CYCLE run */
+        }
+    }
+    return orig(a0, cmd, a2);
+}
+
+static void sd_install_ioctl_hook(void)
+{
+    if (sd_ioctl_hooked) return;
+    uint32_t dev = SD_PSTGDEV_PTR;
+    if (!dev) return;
+    volatile uint32_t *slot = (volatile uint32_t *)(dev + 0x18);
+    if (*slot == SD_IOCTL_ORIG)
+    {
+        *slot = (uint32_t)sd_ioctl_hook | 1u;
+        asm volatile("dmb sy" ::: "memory");
+        sd_ioctl_hooked = 1;
+    }
+}
+
+uint32_t m50_sd_intercept_count(void) { return sd_intercept_count; }
+int m50_sd_intercept_stepdown_mhz(void) { return sd_intercept_stepdown_mhz; }
 
 static int quick_verify_4mb(void)
 {
@@ -271,6 +366,7 @@ static void sd_apply_task(void *is_boot)
         sd_active_mhz = current_pll_mhz();
         sd_brake_hits = 0;
         sd_brake_dead = 0;
+        sd_install_ioctl_hook();
         if (tried_idx == idx)
             snprintf(sd_apply_rinfo, sizeof(sd_apply_rinfo), "N=%d verified", sd_oc_n[tried_idx]);
         else
@@ -367,6 +463,9 @@ void m50_sd_brake_reset_session(void)
 {
     sd_brake_hits = 0;
     sd_brake_dead = 0;
+    sd_intercept_count = 0;
+    sd_intercept_stepdown_mhz = 0;
+    if (sd_active_idx > 1) sd_install_ioctl_hook();
 }
 
 static MENU_SELECT_FUNC(sd_apply_select)

@@ -1336,8 +1336,11 @@ static void crx_writer(void *unused)
 {
     extern int m50_sd_brake_detected(void);
     extern int m50_sd_brake_recover(void);
+    extern uint32_t m50_sd_intercept_count(void);
+    extern int m50_sd_intercept_stepdown_mhz(void);
     int idle_ms = 0;
     int brake_split = 0;
+    uint32_t last_ic = 0;
     while (1)
     {
         uint32_t w = r_wp, r = r_rp;
@@ -1399,11 +1402,22 @@ static void crx_writer(void *unused)
         {
             uint32_t t0 = get_ms_clock();
             int ok = FIO_WriteFile(f, ring + r, want) == (int) want;
-            st_write_ms += get_ms_clock() - t0;
+            uint32_t dt = get_ms_clock() - t0;
+            st_write_ms += dt;
             if (!ok) { LOG("write error (card full?)\n"); stop_req = 1; }
             chunk_bytes += want;
             st_bytes_out += want;
             st_written++;            /* card writes (not frames) */
+            uint32_t ic = m50_sd_intercept_count();
+            if (ic < last_ic) last_ic = 0;
+            if (ic != last_ic)
+            {
+                last_ic = ic;
+                int sd_mhz = m50_sd_intercept_stepdown_mhz();
+                if (sd_mhz) st_sd_stepdown_mhz = sd_mhz;
+                int pll_mhz = (int)(((*(volatile uint32_t *)0xD010F218) >> 4) & 0xFF) * 3;
+                LOG("SD brake intercepted (#%d, %d ms write, now %d MHz, no split)\n", (int)ic, (int)dt, pll_mhz);
+            }
             if (ok && !brake_split && m50_sd_brake_detected())
                 brake_split = 1;
             else if (ok && brake_split)
@@ -2564,7 +2578,8 @@ static void crx_overlay_task(void *unused)
             fill = MIN(ring_used() >> 8, capacity) * 100 / capacity;
             uint32_t sd_drops = st_drop_queue;
             uint32_t camera_drops = crx_camera_drop_count();
-            uint32_t sd_brakes = st_sd_brakes;
+            extern uint32_t m50_sd_intercept_count(void);
+            uint32_t sd_brakes = st_sd_brakes + m50_sd_intercept_count();
             drops = sd_drops + camera_drops;
             int point = fill * CRX_GRAPH_HEIGHT / 100;
             if (sd_brakes > previous_sd_brakes) point |= CRX_GRAPH_SD_BRAKE;
