@@ -1338,6 +1338,7 @@ static void crx_writer(void *unused)
     extern int m50_sd_brake_recover(void);
     extern uint32_t m50_sd_intercept_count(void);
     extern int m50_sd_intercept_stepdown_mhz(void);
+    extern int m50_sd_extreme_mode(void);
     int idle_ms = 0;
     int brake_split = 0;
     uint32_t last_ic = 0;
@@ -1352,7 +1353,8 @@ static void crx_writer(void *unused)
          * never wait on a wrap tail because r_wrap - r cannot grow. */
         if (!wrapped && !brake_split && avail < (4u << 20) && !wr_flush && idle_ms < 400) { msleep(5); idle_ms += 5; continue; }
         idle_ms = 0;
-        uint32_t want = MIN(avail, WR_MAX);
+        uint32_t wr_max = m50_sd_extreme_mode() ? (16u << 20) : WR_MAX;
+        uint32_t want = MIN(avail, wr_max);
         uint32_t au = chunk_bytes % WR_AU;
         if (au)
         {
@@ -2020,6 +2022,7 @@ static void crx_control(void *from_shutter)
     {
         extern void m50_sd_brake_reset_session(void);
         extern int m50_sd_write_opt_mode(void);
+        extern int m50_sd_extreme_mode(void);
         m50_sd_brake_reset_session();
         st_sd_brakes = 0;
         st_sd_stepdown_mhz = 0;
@@ -2027,9 +2030,9 @@ static void crx_control(void *from_shutter)
         int (*get_speed)(uint32_t, int *, int *) = (void *) 0xE01E9E39;   /* storage API: speed mode + clock id */
         get_speed(*(volatile uint32_t *)(0xB130 + 0x10), &sp, &ck);
         int pll_mhz = (int)(((*(volatile uint32_t *)0xD010F218) >> 4) & 0xFF) * 3;
-        LOG("test105: %s copy, ring %d MB; SD mode %d, clock %d (%d MHz), cache %d, wopt %d\n",
+        LOG("test105: %s copy, ring %d MB; SD mode %d, clock %d (%d MHz), cache %d, wopt %d, extreme %d\n",
             "DMA", ring_size >> 20, sp, ck, pll_mhz, *(volatile uint32_t *) 0x19130,
-            m50_sd_write_opt_mode());
+            m50_sd_write_opt_mode(), m50_sd_extreme_mode());
     }
     LOG("%s.CRX stream %dx%d pitch %d, encoded %dx%d (offset %d), %s %d-bit, black %d white %d, fps %d, repack core %d (alive %d)\n",
         fname, width, height, pitch, enc_w, enc_h, enc_off, m50_crx_mode ? "C-RAW" : "lossless",

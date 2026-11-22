@@ -65,6 +65,7 @@ static const int sd_oc_n[] = { 0, 65, 80, 92, 96, 100, 104, 108, 112, 113 };
 static CONFIG_INT("sd.m50_clock_preset", sd_oc_preset, 4);  /* default: 288 MHz (auto-recovers & steps down on brake) */
 static CONFIG_INT("sd.m50_pin_drive", sd_pin_drive, 0);     /* 0=Middle(stock), 1=High(all), 2=High(data), 3=Max(data), 4=Max(all), 5=Low */
 static CONFIG_INT("sd.m50_write_opt", sd_write_opt, 2);     /* 0=Stock FIO, 1=DelayFlush, 2=DelayFlush+CMD20 */
+static CONFIG_INT("sd.m50_brake_mode", sd_brake_mode, 0);   /* 0=Auto stepdown (32M), 1=Extreme (16M, hold clock & retry) */
 
 static int sd_apply_state = 0;  /* 0 idle, 1 running, 2 OK, 3 failed (reverted) */
 static int sd_active_idx = 0;   /* currently active index into sd_oc_n[] */
@@ -226,7 +227,7 @@ static int sd_ioctl_hook(uint32_t a0, uint32_t cmd, uint32_t a2)
             sd_brake_hits = kept;
 
             int stepped = 0;
-            if (sd_brake_hits >= 4 && sd_active_idx > 1)
+            if (!sd_brake_mode && sd_brake_hits >= 4 && sd_active_idx > 1)
             {
                 sd_active_idx--;
                 sd_brake_hits = 0;
@@ -245,6 +246,10 @@ static int sd_ioctl_hook(uint32_t a0, uint32_t cmd, uint32_t a2)
                     sd_intercept_stepdown_mhz = sd_active_mhz;
                     snprintf(sd_apply_rinfo, sizeof(sd_apply_rinfo), "brake->%dM", sd_active_mhz);
                     NotifyBox(3500, "SD brake x4 -> %d MHz (5ms)", sd_active_mhz);
+                }
+                else if (sd_brake_mode)
+                {
+                    NotifyBox(1500, "SD extreme retry #%d @ %d MHz", (int)sd_intercept_count, sd_active_mhz);
                 }
                 else
                 {
@@ -474,7 +479,7 @@ int m50_sd_brake_recover(void)
     sd_brake_hits = kept;
 
     int stepped = 0;
-    if (sd_brake_hits >= 4 && sd_active_idx > 1)
+    if (!sd_brake_mode && sd_brake_hits >= 4 && sd_active_idx > 1)
     {
         sd_active_idx--;
         sd_brake_hits = 0;
@@ -574,6 +579,7 @@ void m50_sd_rec_write_end(void)
 }
 
 int m50_sd_write_opt_mode(void) { return sd_write_opt; }
+int m50_sd_extreme_mode(void) { return sd_brake_mode == 1; }
 
 void m50_sd_brake_reset_session(void)
 {
@@ -674,6 +680,13 @@ static struct menu_entry sd195_menu[] = {
         .max = 2,
         .choices = CHOICES("Stock FIO", "DelayFlush", "DelayFlush+CMD20"),
         .help = "DelayFlush defers exFAT metadata flushes during CRX recording; +CMD20 enables SD Video Speed Class recording mode.",
+    },
+    {
+        .name = "SD brake mode",
+        .priv = &sd_brake_mode,
+        .max = 1,
+        .choices = CHOICES("Auto stepdown (32M)", "Extreme (16M, hold)"),
+        .help = "Auto: 4 brakes in 30s steps clock down (32M writes). Extreme: 16M writes, never steps down, keeps retrying in 5ms.",
     },
     {
         .name = "Apply SD clock",
