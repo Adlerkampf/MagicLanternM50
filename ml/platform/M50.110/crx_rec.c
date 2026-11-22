@@ -1960,8 +1960,9 @@ static void crx_control(void *from_shutter)
         int sp = -1, ck = -1;
         int (*get_speed)(uint32_t, int *, int *) = (void *) 0xE01E9E39;   /* storage API: speed mode + clock id */
         get_speed(*(volatile uint32_t *)(0xB130 + 0x10), &sp, &ck);
-        LOG("test105: %s copy, ring %d MB; SD mode %d, clock %d, cache %d\n",
-            "DMA", ring_size >> 20, sp, ck, *(volatile uint32_t *) 0x19130);
+        int pll_mhz = (int)(((*(volatile uint32_t *)0xD010F218) >> 4) & 0xFF) * 3;
+        LOG("test105: %s copy, ring %d MB; SD mode %d, clock %d (%d MHz), cache %d\n",
+            "DMA", ring_size >> 20, sp, ck, pll_mhz, *(volatile uint32_t *) 0x19130);
     }
     LOG("%s.CRX stream %dx%d pitch %d, encoded %dx%d (offset %d), %s %d-bit, black %d white %d, fps %d, repack core %d (alive %d)\n",
         fname, width, height, pitch, enc_w, enc_h, enc_off, m50_crx_mode ? "C-RAW" : "lossless",
