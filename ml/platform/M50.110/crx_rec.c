@@ -344,7 +344,7 @@ struct job
 /* test59: one RING buffer instead of slots. Frames are packed back to back (pieces padded to 32 bytes);
  * the writer sends big chunks (up to WR_MAX, cut at 4 MB file offsets = SD allocation units).
  * Ring + raw sinks live in Canon's movie RecWork area when it was handed to us, else in fio memory. */
-#define WR_MAX   (16u << 20)
+#define WR_MAX   (32u << 20)
 #define WR_AU    (4u << 20)
 #define RING_TARGET (192u << 20)
 #define NFE 256
@@ -2019,6 +2019,7 @@ static void crx_control(void *from_shutter)
     rec_t0_us = get_us_clock();
     {
         extern void m50_sd_brake_reset_session(void);
+        extern int m50_sd_write_opt_mode(void);
         m50_sd_brake_reset_session();
         st_sd_brakes = 0;
         st_sd_stepdown_mhz = 0;
@@ -2026,8 +2027,9 @@ static void crx_control(void *from_shutter)
         int (*get_speed)(uint32_t, int *, int *) = (void *) 0xE01E9E39;   /* storage API: speed mode + clock id */
         get_speed(*(volatile uint32_t *)(0xB130 + 0x10), &sp, &ck);
         int pll_mhz = (int)(((*(volatile uint32_t *)0xD010F218) >> 4) & 0xFF) * 3;
-        LOG("test105: %s copy, ring %d MB; SD mode %d, clock %d (%d MHz), cache %d\n",
-            "DMA", ring_size >> 20, sp, ck, pll_mhz, *(volatile uint32_t *) 0x19130);
+        LOG("test105: %s copy, ring %d MB; SD mode %d, clock %d (%d MHz), cache %d, wopt %d\n",
+            "DMA", ring_size >> 20, sp, ck, pll_mhz, *(volatile uint32_t *) 0x19130,
+            m50_sd_write_opt_mode());
     }
     LOG("%s.CRX stream %dx%d pitch %d, encoded %dx%d (offset %d), %s %d-bit, black %d white %d, fps %d, repack core %d (alive %d)\n",
         fname, width, height, pitch, enc_w, enc_h, enc_off, m50_crx_mode ? "C-RAW" : "lossless",
@@ -2050,6 +2052,12 @@ static void crx_control(void *from_shutter)
     enc_posted = enc_taken = 0;
     LOG("stage 3: routing on\n");
     save_log();
+    {
+        extern void m50_sd_rec_write_begin(const char *path, int *df_ret, int *cmd20_ret);
+        int df_r = -99, c20_r = -99;
+        m50_sd_rec_write_begin(fname, &df_r, &c20_r);
+        LOG("SD write opt: DelayFlush=%d CMD20=%d\n", df_r, c20_r);
+    }
     cur = 0; last_given = 0; worker_busy = 0;
     for (int i = 0; i < COUNT(sink_owned); i++) sink_owned[i] = 0;
     st_sink_queued = 0;
@@ -2132,6 +2140,7 @@ static void crx_control(void *from_shutter)
     for (int i = 0; i < 3000 && (ring_used() || writer_busy); i++) msleep(10);   /* writer drains (<= 30 s) */
     if (ring_used()) LOG("stop: %d KB not written (dropped)\n", ring_used() >> 10);
     { FILE *ff = f; f = 0; asm volatile("dmb sy" ::: "memory"); for (int i = 0; i < 3000 && writer_busy; i++) msleep(10); if (ff) FIO_CloseFile(ff); }
+    { extern void m50_sd_rec_write_end(void); m50_sd_rec_write_end(); }
     r_rp = r_wp; r_wrap = 0xFFFFFFFF;
     msleep(300);                 /* Canon is back on its own LV buffer */
     if (crx_capture_busy())
@@ -2178,6 +2187,7 @@ static void crx_control(void *from_shutter)
     NotifyBox(5000, "CRX: %d frames encoded, %d dropped, %d MB",
               st_encoded, crx_take_drops(), (int)(st_bytes_out >> 20));
 out:
+    { extern void m50_sd_rec_write_end(void); m50_sd_rec_write_end(); }
     native_raw_stop();
     if (raw_requested) raw_lv_release();
     if (rec_state == 1)

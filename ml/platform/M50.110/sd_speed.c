@@ -51,6 +51,8 @@
 #define SD_SET_CLOCK    0xE01E8953      /* (card, clock code), Thumb */
 #define SD_TUNE         0xE01EB071      /* (card), Thumb */
 #define SD_GET_SPEED    0xE01E9E39      /* (card, int *speed, int *clock), Thumb */
+#define SD_SET_SPEED_CLASS_CTRL 0xE01EA7BF /* (card, ctrl: 0=StartRec, 2=EndRec), Thumb -> SD CMD20 */
+#define FIO_DELAY_FLUSH 0xE054811D      /* (const char *drive, int enable), Thumb -> defers exFAT metadata flushes */
 #define SD0_PIN_BASE    0xD0130128u     /* 6 DIGIC 8 GPIO regs: DAT0..3, CMD, CLK (bits [5:4] = drive strength) */
 #define CLK_195         9
 
@@ -59,9 +61,10 @@
 #define SDCHK_TMP_FILE  "ML/SDCHK.TMP"
 #define SDCHK_SIZE      (4 * 1024 * 1024)
 
-static const int sd_oc_n[] = { 0, 65, 80, 92, 96, 100, 104, 108, 112 };
+static const int sd_oc_n[] = { 0, 65, 80, 92, 96, 100, 104, 108, 112, 113 };
 static CONFIG_INT("sd.m50_clock_preset", sd_oc_preset, 4);  /* default: 288 MHz (auto-recovers & steps down on brake) */
-static CONFIG_INT("sd.m50_pin_drive", sd_pin_drive, 0);     /* 0=Middle(stock), 1=High, 2=Max, 3=Low */
+static CONFIG_INT("sd.m50_pin_drive", sd_pin_drive, 0);     /* 0=Middle(stock), 1=High(all), 2=High(data), 3=Max(data), 4=Max(all), 5=Low */
+static CONFIG_INT("sd.m50_write_opt", sd_write_opt, 2);     /* 0=Stock FIO, 1=DelayFlush, 2=DelayFlush+CMD20 */
 
 static int sd_apply_state = 0;  /* 0 idle, 1 running, 2 OK, 3 failed (reverted) */
 static int sd_active_idx = 0;   /* currently active index into sd_oc_n[] */
@@ -524,6 +527,54 @@ int m50_sd_brake_recover(void)
     return -1;
 }
 
+static int sd_delay_flush_active = 0;
+static int sd_cmd20_active = 0;
+static char sd_delay_flush_drv[4] = "B:";
+
+void m50_sd_rec_write_begin(const char *path, int *df_ret, int *cmd20_ret)
+{
+    int (*delay_flush)(const char *, int) = (void *) FIO_DELAY_FLUSH;
+    int (*speed_ctrl)(uint32_t, uint32_t) = (void *) SD_SET_SPEED_CLASS_CTRL;
+    if (df_ret) *df_ret = -99;
+    if (cmd20_ret) *cmd20_ret = -99;
+    if (path && (path[0] == 'A' || path[0] == 'B') && path[1] == ':')
+    {
+        sd_delay_flush_drv[0] = path[0];
+        sd_delay_flush_drv[1] = ':';
+        sd_delay_flush_drv[2] = 0;
+    }
+    if (sd_write_opt >= 1)
+    {
+        int r = delay_flush(sd_delay_flush_drv, 1);
+        if (df_ret) *df_ret = r;
+        if (r == 0) sd_delay_flush_active = 1;
+    }
+    if (sd_write_opt >= 2)
+    {
+        int r = speed_ctrl(SD_CARD, 0); /* CMD20: Start Recording */
+        if (cmd20_ret) *cmd20_ret = r;
+        if (r == 0) sd_cmd20_active = 1;
+    }
+}
+
+void m50_sd_rec_write_end(void)
+{
+    int (*delay_flush)(const char *, int) = (void *) FIO_DELAY_FLUSH;
+    int (*speed_ctrl)(uint32_t, uint32_t) = (void *) SD_SET_SPEED_CLASS_CTRL;
+    if (sd_cmd20_active)
+    {
+        speed_ctrl(SD_CARD, 2); /* CMD20: End Recording */
+        sd_cmd20_active = 0;
+    }
+    if (sd_delay_flush_active)
+    {
+        delay_flush(sd_delay_flush_drv, 0);
+        sd_delay_flush_active = 0;
+    }
+}
+
+int m50_sd_write_opt_mode(void) { return sd_write_opt; }
+
 void m50_sd_brake_reset_session(void)
 {
     sd_brake_hits = 0;
@@ -606,7 +657,7 @@ static struct menu_entry sd195_menu[] = {
         .priv = &sd_oc_preset,
         .select = sd_preset_select,
         .max = COUNT(sd_oc_n) - 1,
-        .choices = CHOICES("OFF (156 MHz)", "195 MHz (safe)", "240 MHz (OC)", "276 MHz (OC)", "288 MHz (OC)", "300 MHz (OC)", "312 MHz (OC)", "324 MHz (OC)", "336 MHz (max OC)"),
+        .choices = CHOICES("OFF (156 MHz)", "195 MHz (safe)", "240 MHz (OC)", "276 MHz (OC)", "288 MHz (OC)", "300 MHz (OC)", "312 MHz (OC)", "324 MHz (OC)", "336 MHz (OC)", "339 MHz (OC)"),
         .help = "Target SD bus clock via DIGIC 8 CARDPLL (0xD010F218). Auto-applies on boot & auto-steps down if card fails verify.",
     },
     {
@@ -616,6 +667,13 @@ static struct menu_entry sd195_menu[] = {
         .max = 5,
         .choices = CHOICES("Middle (stock)", "High (all)", "High (data only)", "Max (data only)", "Max (all)", "Low (all)"),
         .help = "DIGIC 8 SD0 pin drive (0xD0130128..3C). 'data only' boosts DAT0..3+CMD while keeping SD_CLK clean at Middle.",
+    },
+    {
+        .name = "SD write mode",
+        .priv = &sd_write_opt,
+        .max = 2,
+        .choices = CHOICES("Stock FIO", "DelayFlush", "DelayFlush+CMD20"),
+        .help = "DelayFlush defers exFAT metadata flushes during CRX recording; +CMD20 enables SD Video Speed Class recording mode.",
     },
     {
         .name = "Apply SD clock",
