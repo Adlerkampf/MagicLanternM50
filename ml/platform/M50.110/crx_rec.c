@@ -344,7 +344,7 @@ struct job
 /* test59: one RING buffer instead of slots. Frames are packed back to back (pieces padded to 32 bytes);
  * the writer sends big chunks (up to WR_MAX, cut at 4 MB file offsets = SD allocation units).
  * Ring + raw sinks live in Canon's movie RecWork area when it was handed to us, else in fio memory. */
-#define WR_MAX   (32u << 20)
+#define WR_MAX   (28u << 20) /* 7 x 4 MiB AU; stays under SDDRV's 0xF800 sector (31.0 MiB) single-CMD25 cap */
 #define WR_AU    (4u << 20)
 #define RING_TARGET (192u << 20)
 #define NFE 256
@@ -2023,6 +2023,7 @@ static void crx_control(void *from_shutter)
         extern void m50_sd_brake_reset_session(void);
         extern int m50_sd_write_opt_mode(void);
         extern int m50_sd_extreme_mode(void);
+        extern uint32_t m50_sd_sscg_stock(void);
         m50_sd_brake_reset_session();
         st_sd_brakes = 0;
         st_sd_stepdown_mhz = 0;
@@ -2030,9 +2031,10 @@ static void crx_control(void *from_shutter)
         int (*get_speed)(uint32_t, int *, int *) = (void *) 0xE01E9E39;   /* storage API: speed mode + clock id */
         get_speed(*(volatile uint32_t *)(0xB130 + 0x10), &sp, &ck);
         int pll_mhz = (int)(((*(volatile uint32_t *)0xD010F218) >> 4) & 0xFF) * 3;
-        LOG("test105: %s copy, ring %d MB; SD mode %d, clock %d (%d MHz), cache %d, wopt %d, extreme %d\n",
+        LOG("test105: %s copy, ring %d MB; SD mode %d, clock %d (%d MHz), cache %d, wopt %d, extreme %d, sscg %08x->%08x\n",
             "DMA", ring_size >> 20, sp, ck, pll_mhz, *(volatile uint32_t *) 0x19130,
-            m50_sd_write_opt_mode(), m50_sd_extreme_mode());
+            m50_sd_write_opt_mode(), m50_sd_extreme_mode(),
+            m50_sd_sscg_stock(), *(volatile uint32_t *) 0xD010F224);
     }
     LOG("%s.CRX stream %dx%d pitch %d, encoded %dx%d (offset %d), %s %d-bit, black %d white %d, fps %d, repack core %d (alive %d)\n",
         fname, width, height, pitch, enc_w, enc_h, enc_off, m50_crx_mode ? "C-RAW" : "lossless",

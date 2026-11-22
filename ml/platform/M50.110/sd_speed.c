@@ -57,6 +57,7 @@
 #define CLK_195         9
 
 #define CARDPLL_CTRL    (*(volatile uint32_t *)0xD010F218)
+#define CARDPLL_SSCG    (*(volatile uint32_t *)0xD010F224) /* bit 12 (0x1000) = SSCG enable (must clear while CARDPLL off) */
 #define SD0_CLK_EN      (*(volatile uint32_t *)0xD010060C)
 #define SDCHK_TMP_FILE  "ML/SDCHK.TMP"
 #define SDCHK_SIZE      (4 * 1024 * 1024)
@@ -94,13 +95,23 @@ static int current_pll_mhz(void)
     return n * 3;
 }
 
+static uint32_t sd_sscg_stock = 0xFFFFFFFFu;
+
 static void pll_set_raw(int N)
 {
+    if (sd_sscg_stock == 0xFFFFFFFFu)
+        sd_sscg_stock = CARDPLL_SSCG;
+
     SD0_CLK_EN = 0;
     CARDPLL_CTRL &= ~2u;
     CARDPLL_CTRL &= ~1u;
     asm volatile("dmb sy" ::: "memory");
     msleep(1);
+
+    /* Disable CARDPLL Spread-Spectrum Clock Generation (0xD010F224) while PLL is off
+     * for a zero-dither, lower-jitter SD clock during overclocking. */
+    CARDPLL_SSCG = 0;
+    asm volatile("dmb sy" ::: "memory");
 
     CARDPLL_CTRL = ((uint32_t)N << 4) | 1u;
     asm volatile("dmb sy" ::: "memory");
@@ -580,6 +591,7 @@ void m50_sd_rec_write_end(void)
 
 int m50_sd_write_opt_mode(void) { return sd_write_opt; }
 int m50_sd_extreme_mode(void) { return sd_brake_mode == 1; }
+uint32_t m50_sd_sscg_stock(void) { return sd_sscg_stock; }
 
 void m50_sd_brake_reset_session(void)
 {
@@ -685,8 +697,8 @@ static struct menu_entry sd195_menu[] = {
         .name = "SD brake mode",
         .priv = &sd_brake_mode,
         .max = 1,
-        .choices = CHOICES("Auto stepdown (32M)", "Extreme (16M, hold)"),
-        .help = "Auto: 4 brakes in 30s steps clock down (32M writes). Extreme: 16M writes, never steps down, keeps retrying in 5ms.",
+        .choices = CHOICES("Auto stepdown (28M)", "Extreme (16M, hold)"),
+        .help = "Auto: 4 brakes in 30s steps clock down (28M single-CMD25 writes). Extreme: 16M writes, never steps down, retries in 5ms.",
     },
     {
         .name = "Apply SD clock",
