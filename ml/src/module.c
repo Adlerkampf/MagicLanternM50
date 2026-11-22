@@ -2166,6 +2166,10 @@ static void module_unload_offline_strings(int mod_number)
 static void module_load_task(void* unused) 
 {
     char *lockstr = "If you can read this, ML crashed last time. To save from faulty modules, autoload gets disabled.";
+#ifdef CONFIG_M50
+    /* Give Canon's cold-boot GUI/SD init time to settle before loading .mo modules */
+    msleep(1000);
+#endif
 
     if(!module_autoload_disabled)
     {

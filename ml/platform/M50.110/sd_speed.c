@@ -34,7 +34,17 @@
 #if CONFIG_FW_VERSION == 110 && defined(CONFIG_M50_SD195)
 
 #define SD_CARD         (*(volatile uint32_t *)(0xB130 + 0x10))   /* slot index, 0 = SD */
+#define SD_UHS_HOST     (*(volatile uint32_t *)(0xB130 + 0x14))   /* 1=UHS-I host enabled, 0=disabled by Canon brake (0xE0173CFC) */
+#define SD_INIT_MODE    (*(volatile uint32_t *)(0xB130 + 0x30))   /* 0=UHS-I (SdCARDInitialize), 1=Legacy 3.3V, 2=UHS-II */
+#define SD_UHS_ENABLE(c) (*(volatile uint32_t *)(0xB1CC + (c) * 4)) /* 0=3.3V only, 1=1.8V UHS-I, 2=UHS-II */
 #define SD_UHS_TUNE     0xE0173F17      /* (int), Thumb */
+/* Canon's DEVICE_POWER_CYCLE (0xE017EEB8) first calls 0xE0173CFC which sets SD_UHS_HOST=0!
+ * Calling its 5 inner steps directly with SD_UHS_HOST=1 power-cycles the SD slot BACK into 1.8V UHS-I. */
+#define SD_PC_POWER_OFF   0xE0174521    /* (void) -> uint32_t saved_sleep, Thumb */
+#define SD_PC_HW_REINIT   0xE017453B    /* (void), Thumb (copies SD_UHS_HOST -> 0xB1CC) */
+#define SD_PC_POWER_ON    0xE0173107    /* (void), Thumb (SdCARDInitialize + UHS-I + tune) */
+#define SD_PC_POST_INIT   0xE0173D05    /* (void), Thumb */
+#define SD_PC_RESTORE_SLP 0xE017309B    /* (uint32_t saved_sleep), Thumb */
 #define SD_SET_CLOCK    0xE01E8953      /* (card, clock code), Thumb */
 #define SD_TUNE         0xE01EB071      /* (card), Thumb */
 #define SD_GET_SPEED    0xE01E9E39      /* (card, int *speed, int *clock), Thumb */
@@ -45,11 +55,16 @@
 #define SDCHK_TMP_FILE  "ML/SDCHK.TMP"
 #define SDCHK_SIZE      (4 * 1024 * 1024)
 
-static const int sd_oc_n[] = { 0, 65, 80, 92, 100, 108, 112 };
-static CONFIG_INT("sd.m50_clock_preset", sd_oc_preset, 4);  /* default: 300 MHz (36 MHz margin below 348 MHz cliff; auto-steps down if verify fails) */
+static const int sd_oc_n[] = { 0, 65, 80, 92, 96, 100, 104, 108, 112 };
+static CONFIG_INT("sd.m50_clock_preset", sd_oc_preset, 4);  /* default: 288 MHz (auto-recovers & steps down on brake) */
 
 static int sd_apply_state = 0;  /* 0 idle, 1 running, 2 OK, 3 failed (reverted) */
+static int sd_active_idx = 0;   /* currently active index into sd_oc_n[] */
 static int sd_active_mhz = 0;
+#define SD_BRAKE_WINDOW_MS 60000 /* 4 hits within 60 s triggers 1-notch step-down */
+static int sd_brake_hits = 0;   /* brake hits inside current sliding window */
+static int sd_brake_ts[4];      /* get_ms_clock() timestamps of recent hits */
+static int sd_brake_dead = 0;   /* 1 if 1.8V UHS-I restore failed */
 static char sd_apply_rinfo[24] = "";
 
 static int read_clock(void)
@@ -66,11 +81,8 @@ static int current_pll_mhz(void)
     return n * 3;
 }
 
-static int pll_set_and_tune(uint32_t card, int N)
+static void pll_set_raw(int N)
 {
-    int (*set_clock)(uint32_t, int) = (void *) SD_SET_CLOCK;
-    int (*tune)(uint32_t) = (void *) SD_TUNE;
-
     SD0_CLK_EN = 0;
     CARDPLL_CTRL &= ~2u;
     CARDPLL_CTRL &= ~1u;
@@ -84,10 +96,61 @@ static int pll_set_and_tune(uint32_t card, int N)
     CARDPLL_CTRL = ((uint32_t)N << 4) | 3u;
     asm volatile("dmb sy" ::: "memory");
     msleep(1);
+}
 
+static int pll_set_and_tune(uint32_t card, int N)
+{
+    int (*set_clock)(uint32_t, int) = (void *) SD_SET_CLOCK;
+    int (*tune)(uint32_t) = (void *) SD_TUNE;
+
+    pll_set_raw(N);
     if (set_clock(card, CLK_195) & 1) return -1;
     if (tune(card) & 1) return -2;
     return 0;
+}
+
+/* Power-cycle ONLY the SD slot back into 1.8V UHS-I (caller MUST have zero open files).
+ * Returns 1 if the card came back in 1.8V UHS-I (speed >= 2, clock <= 9), 0 if still 3.3V. */
+static int sd_last_pc_speed = -1, sd_last_pc_clock = -1;
+static uint32_t sd_last_pc_m0 = 0, sd_last_pc_u0 = 0;
+
+static int sd_power_cycle_to_uhs(void)
+{
+    uint32_t (*pc_off)(void) = (void *) SD_PC_POWER_OFF;
+    void (*pc_reinit)(void) = (void *) SD_PC_HW_REINIT;
+    void (*pc_on)(void) = (void *) SD_PC_POWER_ON;
+    void (*pc_post)(void) = (void *) SD_PC_POST_INIT;
+    void (*pc_restore)(uint32_t) = (void *) SD_PC_RESTORE_SLP;
+    void (*canon_uhs_tune)(int) = (void *) SD_UHS_TUNE;
+    int (*get_speed)(uint32_t, int *, int *) = (void *) SD_GET_SPEED;
+    uint32_t card = SD_CARD;
+
+    sd_last_pc_m0 = SD_UHS_HOST;
+    sd_last_pc_u0 = SD_UHS_ENABLE(card);
+
+    /* Reset CARDPLL to stock 780 MHz and re-enable UHSHost (0xB144 = 1) before power-cycling.
+     * Skip 0xE0173CFC (which sets 0xB144 = 0) and run DEVICE_POWER_CYCLE's 5 inner steps directly. */
+    pll_set_raw(65);
+    SD0_CLK_EN = 1;
+    SD_INIT_MODE = 0;
+    SD_UHS_HOST = 1;
+    SD_UHS_ENABLE(card) = 1;
+    asm volatile("dmb sy" ::: "memory");
+    msleep(2);
+
+    uint32_t saved_sleep = pc_off();
+    pc_reinit();
+    pc_on();
+    pc_post();
+    pc_restore(saved_sleep);
+    msleep(10);
+    canon_uhs_tune(1);
+
+    int speed = -1, clock = -1;
+    get_speed(card, &speed, &clock);
+    sd_last_pc_speed = speed;
+    sd_last_pc_clock = clock;
+    return (speed >= 2 && clock <= CLK_195);
 }
 
 static int quick_verify_4mb(void)
@@ -142,18 +205,31 @@ static int quick_verify_4mb(void)
     return ok;
 }
 
-static void sd_apply_task(void *unused)
+static void sd_apply_task(void *is_boot)
 {
     extern int ml_started;
     while (!ml_started) msleep(100);
-    msleep(500);
+    /* On boot, wait for module_load_task (.mo/.sym reads) and Canon's cold-boot SD init to finish */
+    msleep(is_boot ? 2500 : 200);
 
     uint32_t card = SD_CARD;
     int idx = sd_oc_preset;
     if (idx < 0 || idx >= (int)COUNT(sd_oc_n)) idx = (int)COUNT(sd_oc_n) - 1;
 
     void (*canon_uhs_tune)(int) = (void *) SD_UHS_TUNE;
-    canon_uhs_tune(1);
+    if (read_clock() >= 10)
+    {
+        if (!sd_power_cycle_to_uhs())
+        {
+            sd_active_idx = 0;
+            sd_active_mhz = 0;
+            snprintf(sd_apply_rinfo, sizeof(sd_apply_rinfo), "3.3V stuck");
+            sd_apply_state = 3;
+            return;
+        }
+    }
+    else
+        canon_uhs_tune(1);
 
     if (idx == 0)
     {
@@ -184,19 +260,113 @@ static void sd_apply_task(void *unused)
     {
         pll_set_and_tune(card, 65);
         canon_uhs_tune(1);
+        sd_active_idx = 0;
         sd_active_mhz = (read_clock() == CLK_195) ? current_pll_mhz() : 0;
         snprintf(sd_apply_rinfo, sizeof(sd_apply_rinfo), "reverted");
         sd_apply_state = 3;
     }
     else
     {
+        sd_active_idx = tried_idx;
         sd_active_mhz = current_pll_mhz();
+        sd_brake_hits = 0;
+        sd_brake_dead = 0;
         if (tried_idx == idx)
             snprintf(sd_apply_rinfo, sizeof(sd_apply_rinfo), "N=%d verified", sd_oc_n[tried_idx]);
         else
             snprintf(sd_apply_rinfo, sizeof(sd_apply_rinfo), "stepdown N=%d", sd_oc_n[tried_idx]);
         sd_apply_state = 2;
     }
+}
+
+/* Fast 10 ns check called by crx_writer() after each FIO_WriteFile.
+ * Returns 1 if Canon's SD brake dropped the clock (0x19130 != 9), 0 if healthy. */
+int m50_sd_brake_detected(void)
+{
+    if (sd_active_idx <= 1 || sd_brake_dead) return 0;
+    return (*(volatile uint32_t *)0x19130) != CLK_195;
+}
+
+/* Called by crx_writer() ONLY AFTER cleanly closing the current .CRX chunk (zero open files).
+ * If Canon dropped to 3.3V (clk >= 10), power-cycles ONLY the SD slot back to 1.8V UHS-I.
+ * Hits 1..3: re-tune at current speed. Hit 4: step down 1 notch + NotifyBox.
+ * Returns: >0 = recovered MHz, < -1 = stepped down to -ret MHz, -1 = unrecoverable. */
+int m50_sd_brake_recover(void)
+{
+    if (sd_active_idx <= 1 || sd_brake_dead) return 0;
+    uint32_t clk = *(volatile uint32_t *)0x19130;
+    if (clk == CLK_195) return 0;
+
+    uint32_t card = SD_CARD;
+    int now_ms = get_ms_clock();
+    /* Drop hits older than SD_BRAKE_WINDOW_MS (60 s) so rare glitches minutes apart don't step down */
+    int kept = 0;
+    for (int i = 0; i < sd_brake_hits && i < 4; i++)
+    {
+        if ((uint32_t)(now_ms - sd_brake_ts[i]) <= SD_BRAKE_WINDOW_MS)
+            sd_brake_ts[kept++] = sd_brake_ts[i];
+    }
+    if (kept < 4) sd_brake_ts[kept++] = now_ms;
+    sd_brake_hits = kept;
+
+    int stepped = 0;
+    if (sd_brake_hits >= 4 && sd_active_idx > 1)
+    {
+        sd_active_idx--;
+        sd_brake_hits = 0;
+        stepped = 1;
+    }
+
+    /* If Canon power-cycled the card down to 3.3V (clock >= 10), power-cycle back to 1.8V UHS-I.
+     * NEVER force clock=9 / CMD19 tuning if the card is still in 3.3V (that locks it up to 0 MB/s!). */
+    if (clk >= 10)
+    {
+        if (!sd_power_cycle_to_uhs())
+        {
+            sd_brake_dead = 1;
+            NotifyBox(5000, "SD 1.8V fail: sp=%d ck=%d (was m=%d u=%d)",
+                      sd_last_pc_speed, sd_last_pc_clock, (int)sd_last_pc_m0, (int)sd_last_pc_u0);
+            return -1;
+        }
+    }
+
+    int target_n = sd_oc_n[sd_active_idx];
+    if (pll_set_and_tune(card, target_n) == 0)
+    {
+        sd_active_mhz = current_pll_mhz();
+        if (stepped)
+        {
+            snprintf(sd_apply_rinfo, sizeof(sd_apply_rinfo), "brake->%dM", sd_active_mhz);
+            NotifyBox(4000, "SD brake x4 -> clocked down to %d MHz", sd_active_mhz);
+            return -sd_active_mhz;
+        }
+        NotifyBox(2500, "SD brake #%d/3 -> retuned %d MHz", sd_brake_hits, sd_active_mhz);
+        return sd_active_mhz;
+    }
+
+    /* Step down until CMD19 tuning succeeds */
+    while (sd_active_idx > 1)
+    {
+        sd_active_idx--;
+        if (pll_set_and_tune(card, sd_oc_n[sd_active_idx]) == 0)
+        {
+            sd_active_mhz = current_pll_mhz();
+            sd_brake_hits = 0;
+            snprintf(sd_apply_rinfo, sizeof(sd_apply_rinfo), "brake->%dM", sd_active_mhz);
+            NotifyBox(4000, "SD brake -> clocked down to %d MHz", sd_active_mhz);
+            return -sd_active_mhz;
+        }
+    }
+
+    sd_brake_dead = 1;
+    NotifyBox(4000, "SD brake -> 48 MHz (reboot to restore)");
+    return -1;
+}
+
+void m50_sd_brake_reset_session(void)
+{
+    sd_brake_hits = 0;
+    sd_brake_dead = 0;
 }
 
 static MENU_SELECT_FUNC(sd_apply_select)
@@ -261,7 +431,7 @@ static struct menu_entry sd195_menu[] = {
         .priv = &sd_oc_preset,
         .select = sd_preset_select,
         .max = COUNT(sd_oc_n) - 1,
-        .choices = CHOICES("OFF (156 MHz)", "195 MHz (safe)", "240 MHz (OC)", "276 MHz (OC)", "300 MHz (OC)", "324 MHz (OC)", "336 MHz (max OC)"),
+        .choices = CHOICES("OFF (156 MHz)", "195 MHz (safe)", "240 MHz (OC)", "276 MHz (OC)", "288 MHz (OC)", "300 MHz (OC)", "312 MHz (OC)", "324 MHz (OC)", "336 MHz (max OC)"),
         .help = "Target SD bus clock via DIGIC 8 CARDPLL (0xD010F218). Auto-applies on boot & auto-steps down if card fails verify.",
     },
     {
@@ -277,7 +447,7 @@ static void sd195_init(void *unused)
     if (sd_oc_preset > 0)
     {
         sd_apply_state = 1;
-        task_create("m50_sdclk", 0x1c, 0x1000, sd_apply_task, 0);
+        task_create("m50_sdclk", 0x1c, 0x1000, sd_apply_task, (void *)1);
     }
 }
 

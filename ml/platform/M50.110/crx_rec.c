@@ -163,7 +163,7 @@ static uint32_t pc_x0b, pc_rowb;                 /* test67 pre-crop: byte offset
 static uint8_t *pc_buf[2];                       /* cropped or 12-bit input per sink (stride == width) */
 static volatile uint32_t st_pc_us, st_pc_max, st_pc_bad;
 static volatile int rec_live = 0;           /* 0 = encoder warm-up (first encodes take ~0.4 s): frames not written */                     /* 1: write only 1 frame in 24 (pipeline test on a slow card) */
-static volatile uint32_t st_enc_bytes = 0;  /* every encoded frame reaching the writer, written or not */                     /* 1: let the EDMAC pack unit write Canon packing */
+static volatile uint64_t st_enc_bytes = 0;  /* every encoded frame reaching the writer, written or not */
 
 /* ---- state ---- */
 enum { CRX_SD_TEST = 4 };
@@ -397,8 +397,11 @@ static void * volatile cb_handle;
 static volatile uint32_t cb_a2;
 
 /* stats */
+static volatile uint32_t st_sd_brakes = 0;
+static volatile int st_sd_stepdown_mhz = 0;
 static volatile uint32_t st_hooked, st_drop_worker, st_drop_slot, st_drop_queue, st_encoded,
-                         st_written, st_enc_err, st_bytes_out, st_free_err;
+                         st_written, st_enc_err, st_free_err;
+static volatile uint64_t st_bytes_out;
 static volatile uint32_t st_enc_us, st_enc_max, st_write_ms;
 static volatile int st_cache_bad = 0;
 static uint64_t rec_t0_us;
@@ -1328,9 +1331,13 @@ static int open_chunk(void)
     return 1;
 }
 
+static void save_log(void);
 static void crx_writer(void *unused)
 {
+    extern int m50_sd_brake_detected(void);
+    extern int m50_sd_brake_recover(void);
     int idle_ms = 0;
+    int brake_split = 0;
     while (1)
     {
         uint32_t w = r_wp, r = r_rp;
@@ -1340,7 +1347,7 @@ static void crx_writer(void *unused)
         if (!avail || !f) { if (!avail) { msleep(5); continue; } }
         /* collect big writes: wait (max 400 ms) until 4 MB is there;
          * never wait on a wrap tail because r_wrap - r cannot grow. */
-        if (!wrapped && avail < (4u << 20) && !wr_flush && idle_ms < 400) { msleep(5); idle_ms += 5; continue; }
+        if (!wrapped && !brake_split && avail < (4u << 20) && !wr_flush && idle_ms < 400) { msleep(5); idle_ms += 5; continue; }
         idle_ms = 0;
         uint32_t want = MIN(avail, WR_MAX);
         uint32_t au = chunk_bytes % WR_AU;
@@ -1353,6 +1360,30 @@ static void crx_writer(void *unused)
         else if (want >= WR_AU)
         {
             want &= ~(WR_AU - 1);
+        }
+        if (f && brake_split)
+        {
+            /* Finish the current frame cleanly, close file, power-cycle SD back to 1.8V UHS-I, open next chunk */
+            uint64_t next_end = 0;
+            for (uint32_t k = 0; k < NFE; k++)
+                if (fe[k] > r_cons && (!next_end || fe[k] < next_end)) next_end = fe[k];
+            if (next_end && next_end <= r_cons + avail)
+                want = (uint32_t)(next_end - r_cons);
+            else if (!next_end)
+            {
+                /* Already on a frame boundary: close, power-cycle + re-tune, open next chunk */
+                FIO_CloseFile(f); f = 0;
+                int br = m50_sd_brake_recover();
+                if (br != 0) st_sd_brakes++;
+                if (br > 0) LOG("SD brake: power-cycled & re-tuned %d MHz\n", br);
+                else if (br < -1) { st_sd_stepdown_mhz = -br; LOG("SD brake x4: power-cycled & stepped down to %d MHz\n", -br); }
+                else if (br == -1) { st_sd_stepdown_mhz = 48; LOG("SD brake: recovery failed, staying at 48 MHz\n"); }
+                save_log();
+                brake_split = 0;
+                chunk++;
+                if (!open_chunk()) stop_req = 1;
+                continue;
+            }
         }
         if (f && chunk_bytes + want > CHUNK_LIMIT)
         {
@@ -1373,7 +1404,23 @@ static void crx_writer(void *unused)
             chunk_bytes += want;
             st_bytes_out += want;
             st_written++;            /* card writes (not frames) */
-            if (chunk_bytes >= CHUNK_LIMIT) { FIO_CloseFile(f); f = 0; chunk++; if (!open_chunk()) stop_req = 1; }
+            if (ok && !brake_split && m50_sd_brake_detected())
+                brake_split = 1;
+            else if (ok && brake_split)
+            {
+                /* Just finished the frame boundary: close, power-cycle SD back to 1.8V UHS-I, open next chunk */
+                FIO_CloseFile(f); f = 0;
+                int br = m50_sd_brake_recover();
+                if (br != 0) st_sd_brakes++;
+                if (br > 0) LOG("SD brake: power-cycled & re-tuned %d MHz\n", br);
+                else if (br < -1) { st_sd_stepdown_mhz = -br; LOG("SD brake x4: power-cycled & stepped down to %d MHz\n", -br); }
+                else if (br == -1) { st_sd_stepdown_mhz = 48; LOG("SD brake: recovery failed, staying at 48 MHz\n"); }
+                save_log();
+                brake_split = 0;
+                chunk++;
+                if (!open_chunk()) stop_req = 1;
+            }
+            if (f && chunk_bytes >= CHUNK_LIMIT) { FIO_CloseFile(f); f = 0; chunk++; if (!open_chunk()) stop_req = 1; }
         }
         asm volatile("dmb sy" ::: "memory");
         r_cons += want;
@@ -1957,6 +2004,10 @@ static void crx_control(void *from_shutter)
     frame_counter = 0;
     rec_t0_us = get_us_clock();
     {
+        extern void m50_sd_brake_reset_session(void);
+        m50_sd_brake_reset_session();
+        st_sd_brakes = 0;
+        st_sd_stepdown_mhz = 0;
         int sp = -1, ck = -1;
         int (*get_speed)(uint32_t, int *, int *) = (void *) 0xE01E9E39;   /* storage API: speed mode + clock id */
         get_speed(*(volatile uint32_t *)(0xB130 + 0x10), &sp, &ck);
@@ -1995,8 +2046,8 @@ static void crx_control(void *from_shutter)
     asm volatile("dmb sy" ::: "memory");
     routing = 1;
 
-    int t_last = get_ms_clock(); uint32_t w_last = 0, h_last = 0, e_last = 0, b_last = 0;
-    uint32_t written_last = 0;
+    int t_last = get_ms_clock(); uint32_t w_last = 0, h_last = 0, e_last = 0;
+    uint64_t b_last = 0, written_last = 0;
     extern uint32_t m50_daf_dma_programs(unsigned channel);
     uint32_t daf_a = m50_daf_dma_programs(0), daf_b = m50_daf_dma_programs(1);
     unsigned owners = UINT32_MAX;
@@ -2014,11 +2065,13 @@ static void crx_control(void *from_shutter)
         }
         if (now - t_last >= 1000)
         {
-            uint32_t encoded = st_encoded, encoded_bytes = st_enc_bytes, written = st_bytes_out;
-            uint32_t frames = encoded - e_last, bytes = encoded_bytes - b_last;
+            uint32_t encoded = st_encoded;
+            uint64_t encoded_bytes = st_enc_bytes, written = st_bytes_out;
+            uint32_t frames = encoded - e_last;
+            uint32_t bytes = (uint32_t)(encoded_bytes - b_last);
             uint32_t elapsed_ms = now - t_last;
             rec_fps = frames * 1000 / elapsed_ms;
-            rec_write_rate10 = (written - written_last + elapsed_ms * 50) / (elapsed_ms * 100);
+            rec_write_rate10 = (int)((written - written_last + (uint64_t)elapsed_ms * 50) / ((uint64_t)elapsed_ms * 100));
             /* Extrapolate recent frame sizes to the target rate even if frames
              * were skipped before encoding because the write buffer was full. */
             int target_fps1000 = fps_get_current_x1000();
@@ -2031,7 +2084,7 @@ static void crx_control(void *from_shutter)
                 secs, st_hooked, encoded, frames, st_written, st_written - w_last,
                 st_drop_worker, st_drop_slot, st_drop_queue,
                 jobs_in_flight(), st_pc_us, st_pc_max, st_enc_us, st_enc_max, st_copy_us,
-                bytes >> 10, written >> 20, st_write_ms,
+                bytes >> 10, (int)(written >> 20), st_write_ms,
                 *(volatile uint32_t *)(0xEF24 + 0x34),
                 m50_daf_dma_programs(0) - daf_a, m50_daf_dma_programs(1) - daf_b);
             st_pc_max = st_enc_max = 0;
@@ -2084,12 +2137,12 @@ static void crx_control(void *from_shutter)
     LOG("STOP after %d ms: hooked %d, encoded %d, %d card writes (%d.%d/s), %d MB, drops worker %d slot %d queue %d, enc errors %d, free errors %d, cache fallback %d\n",
         dur, st_hooked, st_encoded, st_written,
         dur ? st_written * 1000 / dur : 0, dur ? (st_written * 10000 / dur) % 10 : 0,
-        st_bytes_out >> 20, st_drop_worker, st_drop_slot, st_drop_queue, st_enc_err, st_free_err, st_cache_bad);
+        (int)(st_bytes_out >> 20), st_drop_worker, st_drop_slot, st_drop_queue, st_enc_err, st_free_err, st_cache_bad);
     {
-        int kbs = dur ? (int)((long long) st_enc_bytes * 1000 / 1024 / dur) : 0;
+        int kbs = dur ? (int)(st_enc_bytes * 1000 / 1024 / dur) : 0;
         LOG("encoded %d frames (%d.%d fps avg), %d MB in total = card would need %d.%d MB/s%s\n",
             st_encoded, dur ? st_encoded * 1000 / dur : 0, dur ? (st_encoded * 10000 / dur) % 10 : 0,
-            st_enc_bytes >> 20, kbs / 1024, (kbs % 1024) * 10 / 1024,
+            (int)(st_enc_bytes >> 20), kbs / 1024, (kbs % 1024) * 10 / 1024,
             m50_crx_sample ? " (pipeline test: only 1 frame in 24 was written)" : "");
     }
     if (record_native) LOG("12-bit LV: %d frames during %d ms of capture, %d.%d fps\n",
@@ -2104,12 +2157,12 @@ static void crx_control(void *from_shutter)
     LOG("copy: %d frames avg %d us, DMA %s (%d spot-check failures, %d CPU pieces), %d card writes avg %d KB\n",
         st_cpA_n, st_cpA_n ? st_cpA_sum / st_cpA_n : 0, cp_dma ? "kept" : "OFF", st_cp_bad, st_cp_cpu,
         st_written, st_written ? (int)(st_bytes_out / st_written) >> 10 : 0);
-    LOG("card: %d MB in %d ms of writing = %d.%d MB/s while busy (%d%% of the time busy)\n", st_bytes_out >> 20, st_write_ms,
+    LOG("card: %d MB in %d ms of writing = %d.%d MB/s while busy (%d%% of the time busy)\n", (int)(st_bytes_out >> 20), st_write_ms,
         st_write_ms ? (int)((st_bytes_out >> 10) / st_write_ms) : 0, st_write_ms ? (int)((st_bytes_out >> 10) * 10 / st_write_ms) % 10 : 0,
         dur ? (int)(st_write_ms * 100 / dur) : 0);
     save_log();
     NotifyBox(5000, "CRX: %d frames encoded, %d dropped, %d MB",
-              st_encoded, crx_take_drops(), st_bytes_out >> 20);
+              st_encoded, crx_take_drops(), (int)(st_bytes_out >> 20));
 out:
     native_raw_stop();
     if (raw_requested) raw_lv_release();
@@ -2401,15 +2454,15 @@ static MENU_UPDATE_FUNC(crx_update)
 {
     static const char *s[] = { "Start", "starting...", "STOP (recording)", "stopping..." };
     MENU_SET_VALUE("%s", rec_state == CRX_SD_TEST ? "SD test running" : s[rec_state & 3]);
-    MENU_SET_RINFO("%d fr, %d MB", st_written, st_bytes_out >> 20);
+    MENU_SET_RINFO("%d fr, %d MB", st_written, (int)(st_bytes_out >> 20));
     MENU_SET_HELP("Files in ML/CRX. Logs in ML/LOGS.");
 }
 
 enum {
     CRX_GRAPH_SAMPLES = 50, CRX_GRAPH_HEIGHT = 20,
     CRX_GRAPH_MARKER_HEIGHT = 4, CRX_GRAPH_MARKER_STEP = 8,
-    CRX_GRAPH_MARKER_SPACE = 2 * CRX_GRAPH_MARKER_STEP,
-    CRX_GRAPH_SD_DROP = 0x40, CRX_GRAPH_CAMERA_DROP = 0x80
+    CRX_GRAPH_MARKER_SPACE = 3 * CRX_GRAPH_MARKER_STEP,
+    CRX_GRAPH_SD_BRAKE = 0x20, CRX_GRAPH_SD_DROP = 0x40, CRX_GRAPH_CAMERA_DROP = 0x80
 };
 
 static void crx_fill_panel(int color, int x, int y, int width, int height)
@@ -2436,13 +2489,15 @@ static void crx_draw_buffer_graph(int x, int y, int width, const uint8_t *histor
     for (int i = 0; i < count; i++)
     {
         int point = history[sample];
-        int level = point & ~(CRX_GRAPH_SD_DROP | CRX_GRAPH_CAMERA_DROP);
+        int level = point & ~(CRX_GRAPH_SD_BRAKE | CRX_GRAPH_SD_DROP | CRX_GRAPH_CAMERA_DROP);
         int px = x + (CRX_GRAPH_SAMPLES - count + i) * (width - 1) / (CRX_GRAPH_SAMPLES - 1);
         int py = baseline - level;
         int color = level >= CRX_GRAPH_HEIGHT * 4 / 5 ? COLOR_YELLOW : COLOR_GREEN1;
         if (i) draw_line(previous_x, previous_y, px, py, color);
+        if (point & CRX_GRAPH_SD_BRAKE)
+            bmp_fill(COLOR_CYAN, px - 1, y - CRX_GRAPH_MARKER_SPACE, 4, CRX_GRAPH_MARKER_HEIGHT);
         if (point & CRX_GRAPH_SD_DROP)
-            bmp_fill(COLOR_MAGENTA, px - 1, y - CRX_GRAPH_MARKER_SPACE, 4, CRX_GRAPH_MARKER_HEIGHT);
+            bmp_fill(COLOR_MAGENTA, px - 1, y - 2 * CRX_GRAPH_MARKER_STEP, 4, CRX_GRAPH_MARKER_HEIGHT);
         if (point & CRX_GRAPH_CAMERA_DROP)
             bmp_fill(COLOR_RED, px - 1, y - CRX_GRAPH_MARKER_STEP, 4, CRX_GRAPH_MARKER_HEIGHT);
         previous_x = px;
@@ -2495,7 +2550,7 @@ static void crx_overlay_task(void *unused)
     enum { PAD = 9, GAP = 4 };
     uint8_t history[CRX_GRAPH_SAMPLES];
     int count = 0, next = 0;
-    uint32_t previous_sd_drops = 0, previous_camera_drops = 0;
+    uint32_t previous_sd_drops = 0, previous_camera_drops = 0, previous_sd_brakes = 0;
     struct crx_matte previous_matte = {0};
     int old_x = 0, old_y = 0, old_w = 0, old_h = 0;
     for (;;)
@@ -2509,20 +2564,23 @@ static void crx_overlay_task(void *unused)
             fill = MIN(ring_used() >> 8, capacity) * 100 / capacity;
             uint32_t sd_drops = st_drop_queue;
             uint32_t camera_drops = crx_camera_drop_count();
+            uint32_t sd_brakes = st_sd_brakes;
             drops = sd_drops + camera_drops;
             int point = fill * CRX_GRAPH_HEIGHT / 100;
+            if (sd_brakes > previous_sd_brakes) point |= CRX_GRAPH_SD_BRAKE;
             if (sd_drops > previous_sd_drops) point |= CRX_GRAPH_SD_DROP;
             if (camera_drops > previous_camera_drops) point |= CRX_GRAPH_CAMERA_DROP;
             history[next] = point;
             previous_sd_drops = sd_drops;
             previous_camera_drops = camera_drops;
+            previous_sd_brakes = sd_brakes;
             next = (next + 1) % CRX_GRAPH_SAMPLES;
             if (count < CRX_GRAPH_SAMPLES) count++;
         }
         else
         {
             count = next = 0;
-            previous_sd_drops = previous_camera_drops = 0;
+            previous_sd_drops = previous_camera_drops = previous_sd_brakes = 0;
         }
 
         if (!DISPLAY_IS_ON || !SENSOR_MODE_NOW)
@@ -2633,8 +2691,15 @@ static void crx_overlay_task(void *unused)
             int key_x = x + PAD;
             int key_y = graph_y + CRX_GRAPH_HEIGHT + 2 + GAP;
             bmp_puts(FONT(FONT_SMALL, COLOR_MAGENTA, bg), &key_x, &key_y, "SD drops");
-            key_x += 12;
+            key_x += 10;
             bmp_puts(FONT(FONT_SMALL, COLOR_RED, bg), &key_x, &key_y, "Camera drops");
+            key_x += 10;
+            char brake_key[24];
+            if (st_sd_stepdown_mhz)
+                snprintf(brake_key, sizeof(brake_key), "SD->%dM", st_sd_stepdown_mhz);
+            else
+                snprintf(brake_key, sizeof(brake_key), "%s", "SD retune");
+            bmp_puts(FONT(FONT_SMALL, COLOR_CYAN, bg), &key_x, &key_y, brake_key);
         }
         ReleaseRecursiveLock(bmp_lock);
         old_x = x;
