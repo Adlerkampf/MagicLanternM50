@@ -62,18 +62,21 @@
 #define SDCHK_TMP_FILE  "ML/SDCHK.TMP"
 #define SDCHK_SIZE      (4 * 1024 * 1024)
 
-static const int sd_oc_n[] = { 0, 65, 80, 92, 96, 100, 104, 108, 112, 113 };
+static const int sd_oc_n[] = { 0, 65, 80, 92, 96, 100, 104, 108, 112, 113, 114, 115, 116 };
+static const int sd_stepdown_limits[] = { 3, 6, 9, 12, 15, 18 };
 static CONFIG_INT("sd.m50_clock_preset", sd_oc_preset, 4);  /* default: 288 MHz (auto-recovers & steps down on brake) */
 static CONFIG_INT("sd.m50_pin_drive", sd_pin_drive, 0);     /* 0=Middle(stock), 1=High(all), 2=High(data), 3=Max(data), 4=Max(all), 5=Low */
-static CONFIG_INT("sd.m50_write_opt", sd_write_opt, 2);     /* 0=Stock FIO, 1=DelayFlush, 2=DelayFlush+CMD20 */
-static CONFIG_INT("sd.m50_brake_mode", sd_brake_mode, 0);   /* 0=Auto stepdown (32M), 1=Extreme (16M, hold clock & retry) */
+static CONFIG_INT("sd.m50_write_opt", sd_write_opt, 2);     /* 0=Stock FIO, 1=DelayFlush, 2=DelayFlush+CreateSC */
+static CONFIG_INT("sd.m50_brake_mode", sd_brake_mode, 0);   /* 0=Auto stepdown (28M), 1=Extreme (16M, hold clock & retry) */
+static CONFIG_INT("sd.m50_stepdown_hits", sd_stepdown_idx, 0); /* index into sd_stepdown_limits: 3, 6, 9, 12, 15, 18 */
 
 static int sd_apply_state = 0;  /* 0 idle, 1 running, 2 OK, 3 failed (reverted) */
 static int sd_active_idx = 0;   /* currently active index into sd_oc_n[] */
 static int sd_active_mhz = 0;
-#define SD_BRAKE_WINDOW_MS 30000 /* 4 hits within 30 s triggers 1-notch step-down */
+#define SD_BRAKE_WINDOW_MS 30000 /* hits within 30 s triggers 1-notch step-down */
+#define SD_BRAKE_TS_MAX    20
 static int sd_brake_hits = 0;   /* brake hits inside current sliding window */
-static int sd_brake_ts[4];      /* get_ms_clock() timestamps of recent hits */
+static int sd_brake_ts[SD_BRAKE_TS_MAX]; /* get_ms_clock() timestamps of recent hits */
 static int sd_brake_dead = 0;   /* 1 if 1.8V UHS-I restore failed */
 static volatile uint32_t sd_intercept_count = 0; /* brakes intercepted inside SDDRV ioctl(0x1004) */
 static volatile int sd_intercept_stepdown_mhz = 0;
@@ -227,18 +230,19 @@ static int sd_ioctl_hook(uint32_t a0, uint32_t cmd, uint32_t a2)
         if (dev && *(volatile uint32_t *)(dev + 0x50) == 0) /* bPowerDown == 0 */
         {
             uint32_t card = SD_CARD;
+            int limit = sd_stepdown_limits[(unsigned)sd_stepdown_idx < COUNT(sd_stepdown_limits) ? sd_stepdown_idx : 0];
             int now_ms = get_ms_clock();
             int kept = 0;
-            for (int i = 0; i < sd_brake_hits && i < 4; i++)
+            for (int i = 0; i < sd_brake_hits && i < SD_BRAKE_TS_MAX; i++)
             {
                 if ((uint32_t)(now_ms - sd_brake_ts[i]) <= SD_BRAKE_WINDOW_MS)
                     sd_brake_ts[kept++] = sd_brake_ts[i];
             }
-            if (kept < 4) sd_brake_ts[kept++] = now_ms;
+            if (kept < SD_BRAKE_TS_MAX) sd_brake_ts[kept++] = now_ms;
             sd_brake_hits = kept;
 
             int stepped = 0;
-            if (!sd_brake_mode && sd_brake_hits >= 4 && sd_active_idx > 1)
+            if (!sd_brake_mode && sd_brake_hits > limit && sd_active_idx > 1)
             {
                 sd_active_idx--;
                 sd_brake_hits = 0;
@@ -256,7 +260,7 @@ static int sd_ioctl_hook(uint32_t a0, uint32_t cmd, uint32_t a2)
                 {
                     sd_intercept_stepdown_mhz = sd_active_mhz;
                     snprintf(sd_apply_rinfo, sizeof(sd_apply_rinfo), "brake->%dM", sd_active_mhz);
-                    NotifyBox(3500, "SD brake x4 -> %d MHz (5ms)", sd_active_mhz);
+                    NotifyBox(3500, "SD brake x%d -> %d MHz (5ms)", limit + 1, sd_active_mhz);
                 }
                 else if (sd_brake_mode)
                 {
@@ -264,7 +268,7 @@ static int sd_ioctl_hook(uint32_t a0, uint32_t cmd, uint32_t a2)
                 }
                 else
                 {
-                    NotifyBox(2000, "SD brake #%d/3 -> %d MHz (5ms)", sd_brake_hits, sd_active_mhz);
+                    NotifyBox(2000, "SD brake #%d/%d -> %d MHz (5ms)", sd_brake_hits, limit, sd_active_mhz);
                 }
                 return 0;
             }
@@ -279,11 +283,11 @@ static int sd_ioctl_hook(uint32_t a0, uint32_t cmd, uint32_t a2)
                     {
                         sd_intercept_stepdown_mhz = sd_active_mhz;
                         snprintf(sd_apply_rinfo, sizeof(sd_apply_rinfo), "brake->%dM", sd_active_mhz);
-                        NotifyBox(3500, "SD brake x4 -> %d MHz (pc)", sd_active_mhz);
+                        NotifyBox(3500, "SD brake x%d -> %d MHz (pc)", limit + 1, sd_active_mhz);
                     }
                     else
                     {
-                        NotifyBox(2000, "SD brake #%d/3 -> %d MHz (pc)", sd_brake_hits, sd_active_mhz);
+                        NotifyBox(2000, "SD brake #%d/%d -> %d MHz (pc)", sd_brake_hits, limit, sd_active_mhz);
                     }
                     return 0;
                 }
@@ -478,19 +482,20 @@ int m50_sd_brake_recover(void)
     if (clk == CLK_195) return 0;
 
     uint32_t card = SD_CARD;
+    int limit = sd_stepdown_limits[(unsigned)sd_stepdown_idx < COUNT(sd_stepdown_limits) ? sd_stepdown_idx : 0];
     int now_ms = get_ms_clock();
-    /* Drop hits older than SD_BRAKE_WINDOW_MS (60 s) so rare glitches minutes apart don't step down */
+    /* Drop hits older than SD_BRAKE_WINDOW_MS (30 s) so rare glitches minutes apart don't step down */
     int kept = 0;
-    for (int i = 0; i < sd_brake_hits && i < 4; i++)
+    for (int i = 0; i < sd_brake_hits && i < SD_BRAKE_TS_MAX; i++)
     {
         if ((uint32_t)(now_ms - sd_brake_ts[i]) <= SD_BRAKE_WINDOW_MS)
             sd_brake_ts[kept++] = sd_brake_ts[i];
     }
-    if (kept < 4) sd_brake_ts[kept++] = now_ms;
+    if (kept < SD_BRAKE_TS_MAX) sd_brake_ts[kept++] = now_ms;
     sd_brake_hits = kept;
 
     int stepped = 0;
-    if (!sd_brake_mode && sd_brake_hits >= 4 && sd_active_idx > 1)
+    if (!sd_brake_mode && sd_brake_hits > limit && sd_active_idx > 1)
     {
         sd_active_idx--;
         sd_brake_hits = 0;
@@ -517,10 +522,10 @@ int m50_sd_brake_recover(void)
         if (stepped)
         {
             snprintf(sd_apply_rinfo, sizeof(sd_apply_rinfo), "brake->%dM", sd_active_mhz);
-            NotifyBox(4000, "SD brake x4 -> clocked down to %d MHz", sd_active_mhz);
+            NotifyBox(4000, "SD brake x%d -> clocked down to %d MHz", limit + 1, sd_active_mhz);
             return -sd_active_mhz;
         }
-        NotifyBox(2500, "SD brake #%d/3 -> retuned %d MHz", sd_brake_hits, sd_active_mhz);
+        NotifyBox(2500, "SD brake #%d/%d -> retuned %d MHz", sd_brake_hits, limit, sd_active_mhz);
         return sd_active_mhz;
     }
 
@@ -544,13 +549,11 @@ int m50_sd_brake_recover(void)
 }
 
 static int sd_delay_flush_active = 0;
-static int sd_cmd20_active = 0;
 static char sd_delay_flush_drv[4] = "B:";
 
 void m50_sd_rec_write_begin(const char *path, int *df_ret, int *cmd20_ret)
 {
     int (*delay_flush)(const char *, int) = (void *) FIO_DELAY_FLUSH;
-    int (*speed_ctrl)(uint32_t, uint32_t) = (void *) SD_SET_SPEED_CLASS_CTRL;
     if (df_ret) *df_ret = -99;
     if (cmd20_ret) *cmd20_ret = -99;
     if (path && (path[0] == 'A' || path[0] == 'B') && path[1] == ':')
@@ -565,23 +568,11 @@ void m50_sd_rec_write_begin(const char *path, int *df_ret, int *cmd20_ret)
         if (df_ret) *df_ret = r;
         if (r == 0) sd_delay_flush_active = 1;
     }
-    if (sd_write_opt >= 2)
-    {
-        int r = speed_ctrl(SD_CARD, 0); /* CMD20: Start Recording */
-        if (cmd20_ret) *cmd20_ret = r;
-        if (r == 0) sd_cmd20_active = 1;
-    }
 }
 
 void m50_sd_rec_write_end(void)
 {
     int (*delay_flush)(const char *, int) = (void *) FIO_DELAY_FLUSH;
-    int (*speed_ctrl)(uint32_t, uint32_t) = (void *) SD_SET_SPEED_CLASS_CTRL;
-    if (sd_cmd20_active)
-    {
-        speed_ctrl(SD_CARD, 2); /* CMD20: End Recording */
-        sd_cmd20_active = 0;
-    }
     if (sd_delay_flush_active)
     {
         delay_flush(sd_delay_flush_drv, 0);
@@ -675,7 +666,7 @@ static struct menu_entry sd195_menu[] = {
         .priv = &sd_oc_preset,
         .select = sd_preset_select,
         .max = COUNT(sd_oc_n) - 1,
-        .choices = CHOICES("OFF (156 MHz)", "195 MHz (safe)", "240 MHz (OC)", "276 MHz (OC)", "288 MHz (OC)", "300 MHz (OC)", "312 MHz (OC)", "324 MHz (OC)", "336 MHz (OC)", "339 MHz (OC)"),
+        .choices = CHOICES("OFF (156 MHz)", "195 MHz (safe)", "240 MHz (OC)", "276 MHz (OC)", "288 MHz (OC)", "300 MHz (OC)", "312 MHz (OC)", "324 MHz (OC)", "336 MHz (OC)", "339 MHz (OC)", "342 MHz (exp)", "345 MHz (exp)", "348 MHz (exp)"),
         .help = "Target SD bus clock via DIGIC 8 CARDPLL (0xD010F218). Auto-applies on boot & auto-steps down if card fails verify.",
     },
     {
@@ -690,15 +681,22 @@ static struct menu_entry sd195_menu[] = {
         .name = "SD write mode",
         .priv = &sd_write_opt,
         .max = 2,
-        .choices = CHOICES("Stock FIO", "DelayFlush", "DelayFlush+CMD20"),
-        .help = "DelayFlush defers exFAT metadata flushes during CRX recording; +CMD20 enables SD Video Speed Class recording mode.",
+        .choices = CHOICES("Stock FIO", "DelayFlush", "DelayFlush+CreateSC"),
+        .help = "DelayFlush defers exFAT metadata flushes; +CreateSC opens CRX via Canon MovWriter CreateSC (exFAT AU speed-class + CMD20).",
     },
     {
         .name = "SD brake mode",
         .priv = &sd_brake_mode,
         .max = 1,
         .choices = CHOICES("Auto stepdown (28M)", "Extreme (16M, hold)"),
-        .help = "Auto: 4 brakes in 30s steps clock down (28M single-CMD25 writes). Extreme: 16M writes, never steps down, retries in 5ms.",
+        .help = "Auto: steps clock down after N brakes in 30s (28M single-CMD25 writes). Extreme: 16M writes, never steps down, retries in 5ms.",
+    },
+    {
+        .name = "SD stepdown hits",
+        .priv = &sd_stepdown_idx,
+        .max = COUNT(sd_stepdown_limits) - 1,
+        .choices = CHOICES("3 retries", "6 retries", "9 retries", "12 retries", "15 retries", "18 retries"),
+        .help = "Number of SD brake retries allowed within 30s before Auto stepdown drops clock 1 notch (ignored in Extreme mode).",
     },
     {
         .name = "Apply SD clock",

@@ -1297,12 +1297,34 @@ static void crx_encoder(void *unused)
 
 #define CHUNK_LIMIT (4000u * 1000u * 1000u)
 
+static int crx_sc = 0; /* 1 = current chunk was opened via Canon MovWriter CreateSC (exFAT AU speed-class + CMD20) */
+static FILE *crx_create(const char *name)
+{
+    extern int m50_sd_write_opt_mode(void);
+    if (m50_sd_write_opt_mode() >= 2)
+    {
+        int (*create_sc)(const char *) = (void *) 0xE0546865;
+        char path[80];
+        snprintf(path, sizeof(path), "%s:/%s", get_ml_card()->drive_letter, name);
+        int fd = create_sc(path);
+        if (fd > 0) { crx_sc = 1; return (FILE *) fd; }
+    }
+    crx_sc = 0;
+    return FIO_CreateFile(name);
+}
+static void crx_close(FILE *ff)
+{
+    int (*close_sc)(int, int) = (void *) 0xE0546E17;
+    if (crx_sc) close_sc((int) ff, get_ml_card()->drive_letter[0] - 'A');
+    else FIO_CloseFile(ff);
+}
+
 static int open_chunk(void)
 {
     char name[64];
     if (chunk == 0) snprintf(name, sizeof(name), "%s.CRX", fname);
     else            snprintf(name, sizeof(name), "%s.C%02d", fname, chunk);
-    f = FIO_CreateFile(name);
+    f = crx_create(name);
     chunk_bytes = 0;
     if (!f) return 0;
     /* file header */
@@ -1377,7 +1399,7 @@ static void crx_writer(void *unused)
             else if (!next_end)
             {
                 /* Already on a frame boundary: close, power-cycle + re-tune, open next chunk */
-                FIO_CloseFile(f); f = 0;
+                crx_close(f); f = 0;
                 int br = m50_sd_brake_recover();
                 if (br != 0) st_sd_brakes++;
                 if (br > 0) LOG("SD brake: power-cycled & re-tuned %d MHz\n", br);
@@ -1396,7 +1418,7 @@ static void crx_writer(void *unused)
             uint64_t lim = r_cons + (CHUNK_LIMIT - chunk_bytes), best = 0;
             for (uint32_t k = 0; k < NFE; k++) if (fe[k] > r_cons && fe[k] <= lim && fe[k] > best) best = fe[k];
             if (best) want = MIN(want, (uint32_t)(best - r_cons));
-            else { FIO_CloseFile(f); f = 0; chunk++; if (!open_chunk()) stop_req = 1; continue; }
+            else { crx_close(f); f = 0; chunk++; if (!open_chunk()) stop_req = 1; continue; }
         }
         writer_busy = 1;
         asm volatile("dmb sy" ::: "memory");
@@ -1425,7 +1447,7 @@ static void crx_writer(void *unused)
             else if (ok && brake_split)
             {
                 /* Just finished the frame boundary: close, power-cycle SD back to 1.8V UHS-I, open next chunk */
-                FIO_CloseFile(f); f = 0;
+                crx_close(f); f = 0;
                 int br = m50_sd_brake_recover();
                 if (br != 0) st_sd_brakes++;
                 if (br > 0) LOG("SD brake: power-cycled & re-tuned %d MHz\n", br);
@@ -1436,7 +1458,7 @@ static void crx_writer(void *unused)
                 chunk++;
                 if (!open_chunk()) stop_req = 1;
             }
-            if (f && chunk_bytes >= CHUNK_LIMIT) { FIO_CloseFile(f); f = 0; chunk++; if (!open_chunk()) stop_req = 1; }
+            if (f && chunk_bytes >= CHUNK_LIMIT) { crx_close(f); f = 0; chunk++; if (!open_chunk()) stop_req = 1; }
         }
         asm volatile("dmb sy" ::: "memory");
         r_cons += want;
@@ -2061,7 +2083,7 @@ static void crx_control(void *from_shutter)
         extern void m50_sd_rec_write_begin(const char *path, int *df_ret, int *cmd20_ret);
         int df_r = -99, c20_r = -99;
         m50_sd_rec_write_begin(fname, &df_r, &c20_r);
-        LOG("SD write opt: DelayFlush=%d CMD20=%d\n", df_r, c20_r);
+        LOG("SD write opt: DelayFlush=%d CreateSC=%d (%s)\n", df_r, crx_sc, crx_sc ? "speed class" : "plain FIO");
     }
     cur = 0; last_given = 0; worker_busy = 0;
     for (int i = 0; i < COUNT(sink_owned); i++) sink_owned[i] = 0;
@@ -2144,7 +2166,7 @@ static void crx_control(void *from_shutter)
     wr_flush = 1;
     for (int i = 0; i < 3000 && (ring_used() || writer_busy); i++) msleep(10);   /* writer drains (<= 30 s) */
     if (ring_used()) LOG("stop: %d KB not written (dropped)\n", ring_used() >> 10);
-    { FILE *ff = f; f = 0; asm volatile("dmb sy" ::: "memory"); for (int i = 0; i < 3000 && writer_busy; i++) msleep(10); if (ff) FIO_CloseFile(ff); }
+    { FILE *ff = f; f = 0; asm volatile("dmb sy" ::: "memory"); for (int i = 0; i < 3000 && writer_busy; i++) msleep(10); if (ff) crx_close(ff); }
     { extern void m50_sd_rec_write_end(void); m50_sd_rec_write_end(); }
     r_rp = r_wp; r_wrap = 0xFFFFFFFF;
     msleep(300);                 /* Canon is back on its own LV buffer */
